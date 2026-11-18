@@ -1,8 +1,11 @@
+<p align="center">
+  <a href="#">
+    <img src="https://github.com/user-attachments/assets/d361a00d-8661-43fb-97ec-bf35e705b7e8" alt="Logo YouTube On PSVita" width="400" style="background: transparent; -webkit-filter: drop-shadow(5px 5px 5px #222); filter: drop-shadow(5px 5px 5px #222);">
+</p>
 <div align="center">
 
-# YouTubeOnVita
+_Unofficial client for PS Vita_
 
-### Unofficial client for PS Vita
 
 **The real YouTube on TV experience, brought to PlayStation Vita through Cobalt.**
 
@@ -11,7 +14,8 @@
 [![Engine](https://img.shields.io/badge/ENGINE-COBALT%20%2B%20STARBOARD-455a64?style=for-the-badge)](#how-it-works)
 [![Build](https://img.shields.io/badge/BUILD-v0.28%20EXPERIMENTAL-ea4335?style=for-the-badge)](#project-status)
 
-*An independent homebrew project by [WolffsRoom](https://github.com/WolffsRoom). Not affiliated with Google, YouTube, or Sony.*
+*An independent homebrew project by [WolffsRoom](https://github.com/WolffsRoom).* <br>
+*Not affiliated with Google, YouTube, or Sony.*
 
 </div>
 
