@@ -1,10 +1,11 @@
 <p align="center">
   <a href="#">
-    <img src="https://github.com/user-attachments/assets/d361a00d-8661-43fb-97ec-bf35e705b7e8" alt="Logo YouTube On PSVita" width="400" style="background: transparent; -webkit-filter: drop-shadow(5px 5px 5px #222); filter: drop-shadow(5px 5px 5px #222);">
+    <img src="https://github.com/user-attachments/assets/c4faea99-cd85-46d5-ac74-9e5dce02f9a5" alt="Logo YouTube On PSVita" width="400" style="background: transparent; -webkit-filter: drop-shadow(5px 5px 5px #222); filter: drop-shadow(5px 5px 5px #222);">
 </p>
 <div align="center">
 
-_Unofficial client for PS Vita_
+_Unofficial client for PS Vita_ 
+
 
 
 **The real YouTube on TV experience, brought to PlayStation Vita through Cobalt.**
