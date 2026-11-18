@@ -1,0 +1,36 @@
+﻿build/
+build-test/
+.vscode/
+*.log
+*.vpk
+*.self
+
+experiments/cobalt/upstream-25/
+experiments/cobalt/vita/*.o
+build-starboard15/
+build-cobalt-research/
+experiments/cobalt/evergreen/*.crx
+experiments/cobalt/evergreen/core25/lib/*.so
+
+# Local outputs, captures and device logs (may contain account data)
+current/
+output/
+logs-psv/
+tools/capture/
+*.psp2dmp
+*.bmp
+*.raw
+vita3k-stdout.txt
+vita3k-stderr.txt
+
+# Research checkouts not part of this project
+third_party/vitube/
+tools/gn-src/
+tools/vitaGL-source-research/
+
+# Capture DLL build products
+tools/opengl_capture/*.dll
+tools/opengl_capture/*.obj
+tools/opengl_capture/*.exp
+tools/opengl_capture/*.lib
+__pycache__/

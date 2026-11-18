@@ -1,0 +1,197 @@
+<?xml version="1.0" ?>
+<familyset version="1">
+  <family name="sans-serif">
+    <font weight="400" style="normal" font_name="Roboto Regular" postscript_name="Roboto-Regular">Roboto-Regular.woff2</font>
+    <font weight="700" style="normal" font_name="Roboto Bold" postscript_name="Roboto-Bold">Roboto-Bold.woff2</font>
+  </family>
+  <alias name="roboto" to="sans-serif"/>
+  <family lang="und-Arab" fallback_priority="0" name="Noto Naskh Arabic UI" pages="0,6-8,32,37,46,251-254">
+    <font weight="400" style="normal">NotoNaskhArabicUI-Regular.woff2</font>
+  </family>
+  <family lang="und-Ethi" pages="0,18-19,45,171,254">
+    <font weight="400" style="normal">NotoSansEthiopic-Regular.woff2</font>
+  </family>
+  <family lang="und-Hebr" pages="0,5,32,37,251,254">
+    <font weight="400" style="normal">NotoSansHebrew-Regular.woff2</font>
+  </family>
+  <family lang="und-Thai" pages="0,2-3,14,32,37,254">
+    <font weight="400" style="normal">NotoSansThaiUI-Regular.woff2</font>
+  </family>
+  <family lang="und-Armn" pages="0,5,32,251">
+    <font weight="400" style="normal">NotoSansArmenian-Regular.woff2</font>
+  </family>
+  <family lang="und-Geor,und-Geok" pages="0,5,16,28,45,254">
+    <font weight="400" style="normal">NotoSansGeorgian-Regular.woff2</font>
+  </family>
+  <family lang="und-Deva" pages="0,2,9,28,32,34,37,168,254">
+    <font weight="400" style="normal">NotoSansDevanagariUI-Regular.woff2</font>
+  </family>
+  <family lang="und-Gujr" pages="0,9-10,32,34,37,168,254">
+    <font weight="400" style="normal">NotoSansGujaratiUI-Regular.woff2</font>
+  </family>
+  <family lang="und-Guru" pages="0,9-10,32,34,37-38,168,254">
+    <font weight="400" style="normal">NotoSansGurmukhiUI-Regular.woff2</font>
+  </family>
+  <family lang="und-Taml" pages="0,9,11,32,34,37,254">
+    <font weight="400" style="normal">NotoSansTamilUI-Regular.woff2</font>
+  </family>
+  <family lang="und-Mlym" pages="0,3,9,13,32,34,37,254">
+    <font weight="400" style="normal">NotoSansMalayalamUI-Regular.woff2</font>
+  </family>
+  <family lang="und-Beng" pages="0,9,32,34,37,254">
+    <font weight="400" style="normal">NotoSansBengaliUI-Regular.woff2</font>
+  </family>
+  <family lang="und-Telu" pages="0,9,12,32,34,37,254">
+    <font weight="400" style="normal">NotoSansTeluguUI-Regular.woff2</font>
+  </family>
+  <family lang="und-Knda" pages="0,9,12,32,34,37,254">
+    <font weight="400" style="normal">NotoSansKannadaUI-Regular.woff2</font>
+  </family>
+  <family lang="und-Orya" pages="0,9,11,32,34,37,254">
+    <font weight="400" style="normal">NotoSansOriyaUI-Regular.woff2</font>
+  </family>
+  <family lang="und-Sinh" pages="0,9,13,32,34,37,254">
+    <font weight="400" style="normal">NotoSansSinhala-Regular.woff2</font>
+  </family>
+  <family lang="und-Khmr" pages="0,23,25,32,37">
+    <font weight="400" style="normal">NotoSansKhmerUI-Regular.woff2</font>
+  </family>
+  <family lang="und-Laoo" pages="0,3,14,32,37">
+    <font weight="400" style="normal">NotoSansLaoUI-Regular.woff2</font>
+  </family>
+  <family lang="und-Mymr" pages="0,16,32,37,169-170,254">
+    <font weight="400" style="normal">NotoSansMyanmarUI-Regular.woff2</font>
+  </family>
+  <family lang="und-Thaa" pages="0,6-7,32,37,253-254">
+    <font weight="400" style="normal">NotoSansThaana-Regular.woff2</font>
+  </family>
+  <family lang="und-Cham" pages="0,3,170">
+    <font weight="400" style="normal">NotoSansCham-Regular.woff2</font>
+  </family>
+  <family lang="und-Adlm" pages="0,6,32,46,489">
+    <font weight="400" style="normal">NotoSansAdlam-Regular.woff2</font>
+  </family>
+  <family lang="und-Bali" pages="0,27,32,37,254">
+    <font weight="400" style="normal">NotoSansBalinese-Regular.woff2</font>
+  </family>
+  <family lang="und-Bamu" pages="0,166,254,360-362">
+    <font weight="400" style="normal">NotoSansBamum-Regular.woff2</font>
+  </family>
+  <family lang="und-Batk" pages="0,27,254">
+    <font weight="400" style="normal">NotoSansBatak-Regular.woff2</font>
+  </family>
+  <family lang="und-Bugi" pages="0,26,32,37,169,254">
+    <font weight="400" style="normal">NotoSansBuginese-Regular.woff2</font>
+  </family>
+  <family lang="und-Buhd" pages="0,23,254">
+    <font weight="400" style="normal">NotoSansBuhid-Regular.woff2</font>
+  </family>
+  <family lang="und-Cans" pages="0-3,20-22,24,254">
+    <font weight="400" style="normal">NotoSansCanadianAboriginal-Regular.woff2</font>
+  </family>
+  <family lang="und-Cher" pages="0,3,19,171">
+    <font weight="400" style="normal">NotoSansCherokee-Regular.woff2</font>
+  </family>
+  <family lang="und-Copt" pages="0,3,29,37,44,254">
+    <font weight="400" style="normal">NotoSansCoptic-Regular.woff2</font>
+  </family>
+  <family lang="und-Glag" pages="0,44,254">
+    <font weight="400" style="normal">NotoSansGlagolitic-Regular.woff2</font>
+  </family>
+  <family lang="und-Hano" pages="0,23,254">
+    <font weight="400" style="normal">NotoSansHanunoo-Regular.woff2</font>
+  </family>
+  <family lang="und-Java" pages="0,32,37,169,254">
+    <font weight="400" style="normal">NotoSansJavanese-Regular.woff2</font>
+  </family>
+  <family lang="und-Kali" pages="0,169,254">
+    <font weight="400" style="normal">NotoSansKayahLi-Regular.woff2</font>
+  </family>
+  <family lang="und-Lepc" pages="0,28,37,254">
+    <font weight="400" style="normal">NotoSansLepcha-Regular.woff2</font>
+  </family>
+  <family lang="und-Limb" pages="0,9,25,254">
+    <font weight="400" style="normal">NotoSansLimbu-Regular.woff2</font>
+  </family>
+  <family lang="und-Lisu" pages="0,2,164,254">
+    <font weight="400" style="normal">NotoSansLisu-Regular.woff2</font>
+  </family>
+  <family lang="und-Mand" pages="0,6,8,254">
+    <font weight="400" style="normal">NotoSansMandaic-Regular.woff2</font>
+  </family>
+  <family lang="und-Mtei" pages="0,170-171,254">
+    <font weight="400" style="normal">NotoSansMeeteiMayek-Regular.woff2</font>
+  </family>
+  <family lang="und-Talu" pages="0,25,254">
+    <font weight="400" style="normal">NotoSansNewTaiLue-Regular.woff2</font>
+  </family>
+  <family lang="und-Nkoo" pages="0,6-7,32,46,253-254">
+    <font weight="400" style="normal">NotoSansNKo-Regular.woff2</font>
+  </family>
+  <family lang="und-Olck" pages="0,28,254">
+    <font weight="400" style="normal">NotoSansOlChiki-Regular.woff2</font>
+  </family>
+  <family lang="und-Rjng" pages="0,169,254">
+    <font weight="400" style="normal">NotoSansRejang-Regular.woff2</font>
+  </family>
+  <family lang="und-Saur" pages="0,32,37,168,254">
+    <font weight="400" style="normal">NotoSansSaurashtra-Regular.woff2</font>
+  </family>
+  <family lang="und-Sund" pages="0,27-28,254">
+    <font weight="400" style="normal">NotoSansSundanese-Regular.woff2</font>
+  </family>
+  <family lang="und-Sylo" pages="0,9,32,37,168,254">
+    <font weight="400" style="normal">NotoSansSylotiNagri-Regular.woff2</font>
+  </family>
+  <family lang="und-Syre" pages="0,3,6-7,32,34,37-38,254">
+    <font weight="400" style="normal">NotoSansSyriacEstrangela-Regular.woff2</font>
+  </family>
+  <family lang="und-Syrn" pages="0,3,6-7,32,34,37-38,254">
+    <font weight="400" style="normal">NotoSansSyriacEastern-Regular.woff2</font>
+  </family>
+  <family lang="und-Syrj" pages="0,3,6-7,32,34,37-38,254">
+    <font weight="400" style="normal">NotoSansSyriacWestern-Regular.woff2</font>
+  </family>
+  <family lang="und-Tglg" pages="0,23,254">
+    <font weight="400" style="normal">NotoSansTagalog-Regular.woff2</font>
+  </family>
+  <family lang="und-Tagb" pages="0,23,254">
+    <font weight="400" style="normal">NotoSansTagbanwa-Regular.woff2</font>
+  </family>
+  <family lang="und-Lana" pages="0,26,32,34,37,254">
+    <font weight="400" style="normal">NotoSansTaiTham-Regular.woff2</font>
+  </family>
+  <family lang="und-Tavt" pages="0,32,37,167,170,254">
+    <font weight="400" style="normal">NotoSansTaiViet-Regular.woff2</font>
+  </family>
+  <family lang="und-Tibt" pages="0,15,32,37,254">
+    <font weight="400" style="normal">NotoSansTibetan-Regular.woff2</font>
+  </family>
+  <family lang="und-Tfng" pages="0,3,32,45,254">
+    <font weight="400" style="normal">NotoSansTifinagh-Regular.woff2</font>
+  </family>
+  <family pages="0,165-166,254">
+    <font weight="400" style="normal">NotoSansVai-Regular.woff2</font>
+  </family>
+  <family pages="32-43,77,257,464-471,496-498,503">
+    <font weight="400" style="normal">NotoSansSymbols-Regular-Subsetted.woff2</font>
+  </family>
+  <family pages="0,32-33,35-39,41,43,48,50,254,496-502,4068,4072">
+    <font weight="400" style="normal">NotoEmoji-Regular.woff2</font>
+  </family>
+  <family lang="und-Zsym" pages="35,37-39,43,496-498">
+    <font weight="400" style="normal">NotoSansSymbols-Regular-Subsetted2.woff2</font>
+  </family>
+  <family pages="0,14,17,32,48-51,77-159,172-215,249-250,254-255,260">
+    <font weight="400" style="normal" disable_synthetic_bolding="true">DroidSansFallback.woff2</font>
+  </family>
+  <family lang="und-Tale" pages="0,3,16,25,48,254">
+    <font weight="400" style="normal">NotoSansTaiLe-Regular.woff2</font>
+  </family>
+  <family lang="und-Yiii" pages="0,48,160-164,254-255">
+    <font weight="400" style="normal">NotoSansYi-Regular.woff2</font>
+  </family>
+  <family lang="und-Mong" pages="0,24,32,36-37,48,254">
+    <font weight="400" style="normal">NotoSansMongolian-Regular.woff2</font>
+  </family>
+</familyset>

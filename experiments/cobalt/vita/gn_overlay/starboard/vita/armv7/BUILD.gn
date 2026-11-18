@@ -1,0 +1,27 @@
+# Partial native Vita Starboard 15 implementation, NOT Cobalt production yet.
+# Final app must link vitaGL/vitashark, VitaSDK kernel/net libraries, pthread,
+# and kubridge. This platform is not sufficient to run all Cobalt exports.
+static_library("starboard_platform") {
+  check_includes = false
+  sources = [
+    "platform15.cpp",
+    "port_window.cpp",
+    "pad_adapter.cpp",
+    "port_files.cpp",
+    "port_sync.cpp",
+    "port_network.cpp",
+    "port_socket_waiter.cpp",
+    "port_runtime.cpp",
+    "port_threads.cpp",
+    "port_graphics.cpp",
+    "port_virtual_memory.cpp",
+    "port_storage.cpp",
+    "port_system.cpp",
+    "port_events.cpp",
+    "port_constants.cpp",
+    "port_optional_unsupported.cpp",
+    "port_media_policy.cpp",
+    "import_lookup.cpp",
+  ]
+  configs += [ "//starboard/build/config:starboard_implementation" ]
+}

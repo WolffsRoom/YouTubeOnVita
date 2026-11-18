@@ -1,0 +1,210 @@
+// Native Starboard symbols backed by actual VitaSDK platform implementations.
+// The lookup only exposes implementations we genuinely have. Missing APIs fail closed.
+#include "starboard/log.h"
+#include "starboard/event.h"
+#include "starboard/accessibility.h"
+#include "starboard/microphone.h"
+#include "starboard/speech_synthesis.h"
+#include "starboard/drm.h"
+#include "starboard/media.h"
+#include "starboard/configuration_constants.h"
+#include "starboard/system.h"
+#include "starboard/cpu_features.h"
+#include "starboard/time.h"
+#include "starboard/window.h"
+#include "starboard/user.h"
+#include "starboard/storage.h"
+#include "starboard/file.h"
+#include "starboard/directory.h"
+#include "starboard/mutex.h"
+#include "starboard/condition_variable.h"
+#include "starboard/socket.h"
+#include "starboard/socket_waiter.h"
+#include "starboard/memory.h"
+#include "starboard/once.h"
+#include "starboard/thread.h"
+#include "starboard/egl.h"
+#include "starboard/gles.h"
+#include <cstdint>
+#include <cstring>
+
+namespace {
+struct Entry { const char* name; uintptr_t pointer; };
+const Entry kExports[] = {
+    {"SbDirectoryClose", reinterpret_cast<uintptr_t>(&SbDirectoryClose)},
+    {"SbDirectoryCreate", reinterpret_cast<uintptr_t>(&SbDirectoryCreate)},
+    {"SbDirectoryGetNext", reinterpret_cast<uintptr_t>(&SbDirectoryGetNext)},
+    {"SbDirectoryOpen", reinterpret_cast<uintptr_t>(&SbDirectoryOpen)},
+    {"SbFileAtomicReplace", reinterpret_cast<uintptr_t>(&SbFileAtomicReplace)},
+    {"SbFileClose", reinterpret_cast<uintptr_t>(&SbFileClose)},
+    {"SbFileDelete", reinterpret_cast<uintptr_t>(&SbFileDelete)},
+    {"SbFileExists", reinterpret_cast<uintptr_t>(&SbFileExists)},
+    {"SbFileFlush", reinterpret_cast<uintptr_t>(&SbFileFlush)},
+    {"SbFileGetInfo", reinterpret_cast<uintptr_t>(&SbFileGetInfo)},
+    {"SbFileGetPathInfo", reinterpret_cast<uintptr_t>(&SbFileGetPathInfo)},
+    {"SbFileOpen", reinterpret_cast<uintptr_t>(&SbFileOpen)},
+    {"SbFileRead", reinterpret_cast<uintptr_t>(&SbFileRead)},
+    {"SbFileSeek", reinterpret_cast<uintptr_t>(&SbFileSeek)},
+    {"SbFileTruncate", reinterpret_cast<uintptr_t>(&SbFileTruncate)},
+    {"SbFileWrite", reinterpret_cast<uintptr_t>(&SbFileWrite)},
+    {"SbMutexAcquire", reinterpret_cast<uintptr_t>(&SbMutexAcquire)},
+    {"SbMutexAcquireTry", reinterpret_cast<uintptr_t>(&SbMutexAcquireTry)},
+    {"SbMutexCreate", reinterpret_cast<uintptr_t>(&SbMutexCreate)},
+    {"SbMutexDestroy", reinterpret_cast<uintptr_t>(&SbMutexDestroy)},
+    {"SbMutexRelease", reinterpret_cast<uintptr_t>(&SbMutexRelease)},
+    {"SbConditionVariableBroadcast", reinterpret_cast<uintptr_t>(&SbConditionVariableBroadcast)},
+    {"SbConditionVariableCreate", reinterpret_cast<uintptr_t>(&SbConditionVariableCreate)},
+    {"SbConditionVariableDestroy", reinterpret_cast<uintptr_t>(&SbConditionVariableDestroy)},
+    {"SbConditionVariableSignal", reinterpret_cast<uintptr_t>(&SbConditionVariableSignal)},
+    {"SbConditionVariableWait", reinterpret_cast<uintptr_t>(&SbConditionVariableWait)},
+    {"SbConditionVariableWaitTimed", reinterpret_cast<uintptr_t>(&SbConditionVariableWaitTimed)},
+    {"SbSocketIsIpv6Supported", reinterpret_cast<uintptr_t>(&SbSocketIsIpv6Supported)},
+    {"SbSocketCreate", reinterpret_cast<uintptr_t>(&SbSocketCreate)},
+    {"SbSocketDestroy", reinterpret_cast<uintptr_t>(&SbSocketDestroy)},
+    {"SbSocketConnect", reinterpret_cast<uintptr_t>(&SbSocketConnect)},
+    {"SbSocketBind", reinterpret_cast<uintptr_t>(&SbSocketBind)},
+    {"SbSocketListen", reinterpret_cast<uintptr_t>(&SbSocketListen)},
+    {"SbSocketAccept", reinterpret_cast<uintptr_t>(&SbSocketAccept)},
+    {"SbSocketGetLastError", reinterpret_cast<uintptr_t>(&SbSocketGetLastError)},
+    {"SbSocketClearLastError", reinterpret_cast<uintptr_t>(&SbSocketClearLastError)},
+    {"SbSocketGetLocalAddress", reinterpret_cast<uintptr_t>(&SbSocketGetLocalAddress)},
+    {"SbSocketReceiveFrom", reinterpret_cast<uintptr_t>(&SbSocketReceiveFrom)},
+    {"SbSocketSendTo", reinterpret_cast<uintptr_t>(&SbSocketSendTo)},
+    {"SbSocketSetBroadcast", reinterpret_cast<uintptr_t>(&SbSocketSetBroadcast)},
+    {"SbSocketSetReuseAddress", reinterpret_cast<uintptr_t>(&SbSocketSetReuseAddress)},
+    {"SbSocketSetReceiveBufferSize", reinterpret_cast<uintptr_t>(&SbSocketSetReceiveBufferSize)},
+    {"SbSocketSetSendBufferSize", reinterpret_cast<uintptr_t>(&SbSocketSetSendBufferSize)},
+    {"SbSocketSetTcpNoDelay", reinterpret_cast<uintptr_t>(&SbSocketSetTcpNoDelay)},
+    {"SbSocketResolve", reinterpret_cast<uintptr_t>(&SbSocketResolve)},
+    {"SbSocketFreeResolution", reinterpret_cast<uintptr_t>(&SbSocketFreeResolution)},
+    {"SbSocketWaiterCreate", reinterpret_cast<uintptr_t>(&SbSocketWaiterCreate)},
+    {"SbSocketWaiterDestroy", reinterpret_cast<uintptr_t>(&SbSocketWaiterDestroy)},
+    {"SbSocketWaiterAdd", reinterpret_cast<uintptr_t>(&SbSocketWaiterAdd)},
+    {"SbSocketWaiterRemove", reinterpret_cast<uintptr_t>(&SbSocketWaiterRemove)},
+    {"SbSocketWaiterWait", reinterpret_cast<uintptr_t>(&SbSocketWaiterWait)},
+    {"SbSocketWaiterWaitTimed", reinterpret_cast<uintptr_t>(&SbSocketWaiterWaitTimed)},
+    {"SbSocketWaiterWakeUp", reinterpret_cast<uintptr_t>(&SbSocketWaiterWakeUp)},
+    {"SbMemoryAllocate", reinterpret_cast<uintptr_t>(&SbMemoryAllocate)},
+    {"SbMemoryAllocateAligned", reinterpret_cast<uintptr_t>(&SbMemoryAllocateAligned)},
+    {"SbMemoryDeallocate", reinterpret_cast<uintptr_t>(&SbMemoryDeallocate)},
+    {"SbMemoryReallocate", reinterpret_cast<uintptr_t>(&SbMemoryReallocate)},
+    {"SbOnce", reinterpret_cast<uintptr_t>(&SbOnce)},
+    {"SbLogFlush", reinterpret_cast<uintptr_t>(&SbLogFlush)},
+    {"SbLogFormat", reinterpret_cast<uintptr_t>(&SbLogFormat)},
+    {"SbLogRawFormat", reinterpret_cast<uintptr_t>(&SbLogRawFormat)},
+    {"SbThreadCreate", reinterpret_cast<uintptr_t>(&SbThreadCreate)},
+    {"SbThreadJoin", reinterpret_cast<uintptr_t>(&SbThreadJoin)},
+    {"SbThreadDetach", reinterpret_cast<uintptr_t>(&SbThreadDetach)},
+    {"SbThreadYield", reinterpret_cast<uintptr_t>(&SbThreadYield)},
+    {"SbThreadSleep", reinterpret_cast<uintptr_t>(&SbThreadSleep)},
+    {"SbThreadGetCurrent", reinterpret_cast<uintptr_t>(&SbThreadGetCurrent)},
+    {"SbThreadIsEqual", reinterpret_cast<uintptr_t>(&SbThreadIsEqual)},
+    {"SbThreadGetId", reinterpret_cast<uintptr_t>(&SbThreadGetId)},
+    {"SbThreadGetName", reinterpret_cast<uintptr_t>(&SbThreadGetName)},
+    {"SbThreadSetName", reinterpret_cast<uintptr_t>(&SbThreadSetName)},
+    {"SbThreadCreateLocalKey", reinterpret_cast<uintptr_t>(&SbThreadCreateLocalKey)},
+    {"SbThreadDestroyLocalKey", reinterpret_cast<uintptr_t>(&SbThreadDestroyLocalKey)},
+    {"SbThreadGetLocalValue", reinterpret_cast<uintptr_t>(&SbThreadGetLocalValue)},
+    {"SbThreadSetLocalValue", reinterpret_cast<uintptr_t>(&SbThreadSetLocalValue)},
+    {"SbGetEglInterface", reinterpret_cast<uintptr_t>(&SbGetEglInterface)},
+    {"SbGetGlesInterface", reinterpret_cast<uintptr_t>(&SbGetGlesInterface)},
+    {"SbMemoryMap", reinterpret_cast<uintptr_t>(&SbMemoryMap)},
+    {"SbMemoryUnmap", reinterpret_cast<uintptr_t>(&SbMemoryUnmap)},
+    {"SbMemoryProtect", reinterpret_cast<uintptr_t>(&SbMemoryProtect)},
+    {"SbUserGetCurrent", reinterpret_cast<uintptr_t>(&SbUserGetCurrent)},
+    {"SbStorageOpenRecord", reinterpret_cast<uintptr_t>(&SbStorageOpenRecord)},
+    {"SbStorageCloseRecord", reinterpret_cast<uintptr_t>(&SbStorageCloseRecord)},
+    {"SbStorageGetRecordSize", reinterpret_cast<uintptr_t>(&SbStorageGetRecordSize)},
+    {"SbStorageReadRecord", reinterpret_cast<uintptr_t>(&SbStorageReadRecord)},
+    {"SbStorageWriteRecord", reinterpret_cast<uintptr_t>(&SbStorageWriteRecord)},
+    {"SbStorageDeleteRecord", reinterpret_cast<uintptr_t>(&SbStorageDeleteRecord)},
+    {"SbCPUFeaturesGet", reinterpret_cast<uintptr_t>(&SbCPUFeaturesGet)},
+    {"SbSystemGetLocaleId", reinterpret_cast<uintptr_t>(&SbSystemGetLocaleId)},
+    {"SbSystemGetProperty", reinterpret_cast<uintptr_t>(&SbSystemGetProperty)},
+    {"SbSystemHasCapability", reinterpret_cast<uintptr_t>(&SbSystemHasCapability)},
+    {"SbSystemGetNumberOfProcessors", reinterpret_cast<uintptr_t>(&SbSystemGetNumberOfProcessors)},
+    {"SbSystemGetTotalCPUMemory", reinterpret_cast<uintptr_t>(&SbSystemGetTotalCPUMemory)},
+    {"SbSystemGetRandomData", reinterpret_cast<uintptr_t>(&SbSystemGetRandomData)},
+    {"SbSystemGetRandomUInt64", reinterpret_cast<uintptr_t>(&SbSystemGetRandomUInt64)},
+    {"SbSystemGetLastError", reinterpret_cast<uintptr_t>(&SbSystemGetLastError)},
+    {"SbSystemClearLastError", reinterpret_cast<uintptr_t>(&SbSystemClearLastError)},
+    {"SbSystemGetErrorString", reinterpret_cast<uintptr_t>(&SbSystemGetErrorString)},
+    {"SbSystemGetExtension", reinterpret_cast<uintptr_t>(&SbSystemGetExtension)},
+    {"SbSystemSupportsResume", reinterpret_cast<uintptr_t>(&SbSystemSupportsResume)},
+    {"SbSystemHideSplashScreen", reinterpret_cast<uintptr_t>(&SbSystemHideSplashScreen)},
+    {"SbEventSchedule", reinterpret_cast<uintptr_t>(&SbEventSchedule)},
+    {"SbEventCancel", reinterpret_cast<uintptr_t>(&SbEventCancel)},
+    {"kSbFileAltSepChar", reinterpret_cast<uintptr_t>(&kSbFileAltSepChar)},
+    {"kSbFileMaxName", reinterpret_cast<uintptr_t>(&kSbFileMaxName)},
+    {"kSbFileMaxPath", reinterpret_cast<uintptr_t>(&kSbFileMaxPath)},
+    {"kSbFileSepChar", reinterpret_cast<uintptr_t>(&kSbFileSepChar)},
+    {"kSbFileSepString", reinterpret_cast<uintptr_t>(&kSbFileSepString)},
+    {"kSbMaxSystemPathCacheDirectorySize", reinterpret_cast<uintptr_t>(&kSbMaxSystemPathCacheDirectorySize)},
+    {"kSbMaxThreadNameLength", reinterpret_cast<uintptr_t>(&kSbMaxThreadNameLength)},
+    {"kSbMaxThreads", reinterpret_cast<uintptr_t>(&kSbMaxThreads)},
+    {"kSbMemoryPageSize", reinterpret_cast<uintptr_t>(&kSbMemoryPageSize)},
+    {"kSbNetworkReceiveBufferSize", reinterpret_cast<uintptr_t>(&kSbNetworkReceiveBufferSize)},
+    {"kSbPathSepChar", reinterpret_cast<uintptr_t>(&kSbPathSepChar)},
+    {"kSbPreferredRgbaByteOrder", reinterpret_cast<uintptr_t>(&kSbPreferredRgbaByteOrder)},
+    {"SbAccessibilityGetTextToSpeechSettings", reinterpret_cast<uintptr_t>(&SbAccessibilityGetTextToSpeechSettings)},
+    {"SbAccessibilityGetDisplaySettings", reinterpret_cast<uintptr_t>(&SbAccessibilityGetDisplaySettings)},
+    {"SbAccessibilityGetCaptionSettings", reinterpret_cast<uintptr_t>(&SbAccessibilityGetCaptionSettings)},
+    {"SbAccessibilitySetCaptionsEnabled", reinterpret_cast<uintptr_t>(&SbAccessibilitySetCaptionsEnabled)},
+    {"SbSpeechSynthesisIsSupported", reinterpret_cast<uintptr_t>(&SbSpeechSynthesisIsSupported)},
+    {"SbSpeechSynthesisSpeak", reinterpret_cast<uintptr_t>(&SbSpeechSynthesisSpeak)},
+    {"SbSpeechSynthesisCancel", reinterpret_cast<uintptr_t>(&SbSpeechSynthesisCancel)},
+    {"SbMicrophoneGetAvailable", reinterpret_cast<uintptr_t>(&SbMicrophoneGetAvailable)},
+    {"SbMicrophoneIsSampleRateSupported", reinterpret_cast<uintptr_t>(&SbMicrophoneIsSampleRateSupported)},
+    {"SbMicrophoneCreate", reinterpret_cast<uintptr_t>(&SbMicrophoneCreate)},
+    {"SbMicrophoneOpen", reinterpret_cast<uintptr_t>(&SbMicrophoneOpen)},
+    {"SbMicrophoneClose", reinterpret_cast<uintptr_t>(&SbMicrophoneClose)},
+    {"SbMicrophoneRead", reinterpret_cast<uintptr_t>(&SbMicrophoneRead)},
+    {"SbMicrophoneDestroy", reinterpret_cast<uintptr_t>(&SbMicrophoneDestroy)},
+    {"SbDrmCreateSystem", reinterpret_cast<uintptr_t>(&SbDrmCreateSystem)},
+    {"SbDrmGenerateSessionUpdateRequest", reinterpret_cast<uintptr_t>(&SbDrmGenerateSessionUpdateRequest)},
+    {"SbDrmUpdateSession", reinterpret_cast<uintptr_t>(&SbDrmUpdateSession)},
+    {"SbDrmCloseSession", reinterpret_cast<uintptr_t>(&SbDrmCloseSession)},
+    {"SbDrmIsServerCertificateUpdatable", reinterpret_cast<uintptr_t>(&SbDrmIsServerCertificateUpdatable)},
+    {"SbDrmUpdateServerCertificate", reinterpret_cast<uintptr_t>(&SbDrmUpdateServerCertificate)},
+    {"SbDrmGetMetrics", reinterpret_cast<uintptr_t>(&SbDrmGetMetrics)},
+    {"SbDrmDestroySystem", reinterpret_cast<uintptr_t>(&SbDrmDestroySystem)},
+    {"SbMediaCanPlayMimeAndKeySystem", reinterpret_cast<uintptr_t>(&SbMediaCanPlayMimeAndKeySystem)},
+    {"SbMediaGetAudioBufferBudget", reinterpret_cast<uintptr_t>(&SbMediaGetAudioBufferBudget)},
+    {"SbMediaGetAudioConfiguration", reinterpret_cast<uintptr_t>(&SbMediaGetAudioConfiguration)},
+    {"SbMediaGetBufferAlignment", reinterpret_cast<uintptr_t>(&SbMediaGetBufferAlignment)},
+    {"SbMediaGetBufferAllocationUnit", reinterpret_cast<uintptr_t>(&SbMediaGetBufferAllocationUnit)},
+    {"SbMediaGetBufferGarbageCollectionDurationThreshold", reinterpret_cast<uintptr_t>(&SbMediaGetBufferGarbageCollectionDurationThreshold)},
+    {"SbMediaGetBufferPadding", reinterpret_cast<uintptr_t>(&SbMediaGetBufferPadding)},
+    {"SbMediaGetInitialBufferCapacity", reinterpret_cast<uintptr_t>(&SbMediaGetInitialBufferCapacity)},
+    {"SbMediaGetProgressiveBufferBudget", reinterpret_cast<uintptr_t>(&SbMediaGetProgressiveBufferBudget)},
+    {"SbMediaGetVideoBufferBudget", reinterpret_cast<uintptr_t>(&SbMediaGetVideoBufferBudget)},
+    {"SbMediaIsBufferPoolAllocateOnDemand", reinterpret_cast<uintptr_t>(&SbMediaIsBufferPoolAllocateOnDemand)},
+    {"SbLog", reinterpret_cast<uintptr_t>(&SbLog)},
+    {"SbLogRaw", reinterpret_cast<uintptr_t>(&SbLogRaw)},
+    {"SbSystemGetPath", reinterpret_cast<uintptr_t>(&SbSystemGetPath)},
+    {"SbTimeGetMonotonicNow", reinterpret_cast<uintptr_t>(&SbTimeGetMonotonicNow)},
+    {"SbTimeGetMonotonicThreadNow",
+        reinterpret_cast<uintptr_t>(&SbTimeGetMonotonicThreadNow)},
+    {"SbTimeGetNow", reinterpret_cast<uintptr_t>(&SbTimeGetNow)},
+    {"SbWindowCreate", reinterpret_cast<uintptr_t>(&SbWindowCreate)},
+    {"SbWindowDestroy", reinterpret_cast<uintptr_t>(&SbWindowDestroy)},
+    {"SbWindowGetDiagonalSizeInInches",
+        reinterpret_cast<uintptr_t>(&SbWindowGetDiagonalSizeInInches)},
+    {"SbWindowGetPlatformHandle",
+        reinterpret_cast<uintptr_t>(&SbWindowGetPlatformHandle)},
+    {"SbWindowGetSize", reinterpret_cast<uintptr_t>(&SbWindowGetSize)},
+    {"SbWindowSetDefaultOptions",
+        reinterpret_cast<uintptr_t>(&SbWindowSetDefaultOptions)}
+};
+}
+extern "C" uintptr_t ytv_find_real_starboard_export(const char* name) {
+  if(!name) return 0;
+  for(const Entry& item : kExports) {
+    if(strcmp(name,item.name)==0)return item.pointer;
+  }
+  return 0;
+}
+extern "C" unsigned ytv_real_starboard_export_count(void) {
+  return sizeof(kExports)/sizeof(kExports[0]);
+}
+

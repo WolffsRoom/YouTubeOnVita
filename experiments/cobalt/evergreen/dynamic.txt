@@ -1,0 +1,21 @@
+
+Dynamic section at offset 0x1fdafd4 contains 18 entries:
+  Tag        Type                         Name/Value
+ 0x0000000e (SONAME)                     Library soname: [libcobalt.so]
+ 0x00000011 (REL)                        0x2ca54
+ 0x00000012 (RELSZ)                      515632 (bytes)
+ 0x00000013 (RELENT)                     8 (bytes)
+ 0x6ffffffa (RELCOUNT)                   61413
+ 0x00000017 (JMPREL)                     0x116c74
+ 0x00000002 (PLTRELSZ)                   5312 (bytes)
+ 0x00000003 (PLTGOT)                     0x201fb88
+ 0x00000014 (PLTREL)                     REL
+ 0x00000006 (SYMTAB)                     0x18c
+ 0x0000000b (SYMENT)                     16 (bytes)
+ 0x00000005 (STRTAB)                     0xd52c
+ 0x0000000a (STRSZ)                      128296 (bytes)
+ 0x6ffffef5 (GNU_HASH)                   0x99ac
+ 0x00000019 (INIT_ARRAY)                 0x1ffaeac
+ 0x0000001b (INIT_ARRAYSZ)               296 (bytes)
+ 0x0000000d (FINI)                       0x171d5a0
+ 0x00000000 (NULL)                       0x0

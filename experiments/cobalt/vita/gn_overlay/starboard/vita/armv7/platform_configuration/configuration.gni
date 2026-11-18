@@ -1,0 +1,5 @@
+import("//starboard/build/config/base_configuration.gni")
+sb_is_evergreen_compatible = false
+sabi_path = "//starboard/sabi/arm/hardfp/sabi-v$sb_api_version.json"
+sb_libevent_method = "select"
+v8_enable_webassembly = false

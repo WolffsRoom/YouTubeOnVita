@@ -1,0 +1,8 @@
+target_platform = "vita-armv7"
+target_os = "linux"  # Temporary GN build-system compatibility, Vita is NOT Linux.
+target_cpu = "arm"
+sb_api_version = 15
+build_with_separate_cobalt_toolchain = false
+sb_is_modular = false
+is_clang = false
+

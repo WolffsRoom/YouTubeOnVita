@@ -1,0 +1,12 @@
+[submodule "third_party/kubridge"]
+	path = third_party/kubridge
+	url = https://github.com/TheOfficialFloW/kubridge.git
+[submodule "third_party/so_util"]
+	path = third_party/so_util
+	url = https://github.com/Rinnegatamante/so_util.git
+[submodule "third_party/vitagl-nosplash-build"]
+	path = third_party/vitagl-nosplash-build
+	url = https://github.com/Rinnegatamante/vitaGL.git
+[submodule "tools/opengl_capture/MinHook"]
+	path = tools/opengl_capture/MinHook
+	url = https://github.com/TsudaKageyu/minhook.git

@@ -1,0 +1,10 @@
+import("//build/toolchain/gcc_toolchain.gni")
+_gcc_bin = "/usr/local/vitasdk/bin"
+gcc_toolchain("target") {
+  cc = "$_gcc_bin/arm-vita-eabi-gcc"
+  cxx = "$_gcc_bin/arm-vita-eabi-g++"
+  ld = cxx
+  ar = "$_gcc_bin/arm-vita-eabi-ar"
+  toolchain_args = { is_clang = false }
+}
+
