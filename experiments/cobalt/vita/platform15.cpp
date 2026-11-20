@@ -6,6 +6,7 @@
 #include "starboard/system.h"
 
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/sysmem.h>
 #include <pthread.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
@@ -71,15 +72,166 @@ void SbLog(SbLogPriority priority, const char* message) {
   SbLogRaw(message);
 }
 
-void* SbMemoryAllocateUnchecked(size_t size) { return malloc(size); }
+// ---- large allocations outside the newlib heap (YouTube Lite) -------------
+// The Lite build has a 64 MiB newlib heap. Media segments (hundreds of KiB to
+// a few MiB each, SbMemoryAllocate) fragmented it: opening a live stream on
+// hardware (v0.48) failed 1-2 MiB allocations with only ~41 MiB in use, and
+// Cobalt crashed right after. Large blocks now get their own memblock (from
+// the free user memory) and go back to the system when freed.
+// A 64-byte header in front of the returned pointer keeps the memblock id.
+extern "C" bool ytv_lowmem() __attribute__((weak));
+namespace {
+constexpr size_t kLargeAlloc = 256 * 1024;
+constexpr size_t kLargeHeader = 64;
+constexpr uint32_t kLargeMagic = 0x59544C42;  // "YTLB"
+struct LargeHeader { uint32_t magic; SceUID uid; uint32_t size; uint32_t block; };
+uintptr_t g_heap_lo = 0, g_heap_hi = 0;
+// Registry of live large blocks (open addressing on the returned pointer):
+// a pointer is only treated as a large block if it is registered here, so a
+// wrong heap range can never send a newlib pointer to large_free().
+constexpr int kLargeSlots = 2048;
+void* volatile g_large_slots[kLargeSlots];
+pthread_mutex_t g_large_lock = PTHREAD_MUTEX_INITIALIZER;
+inline unsigned slot_of(void* p) { return ((uintptr_t)p >> 12) * 2654435761u % kLargeSlots; }
+bool registry_add(void* p) {
+  pthread_mutex_lock(&g_large_lock);
+  unsigned i = slot_of(p);
+  for (int n = 0; n < kLargeSlots; n++, i = (i + 1) % kLargeSlots) {
+    if (!g_large_slots[i] || g_large_slots[i] == (void*)1) {
+      g_large_slots[i] = p;
+      pthread_mutex_unlock(&g_large_lock);
+      return true;
+    }
+  }
+  pthread_mutex_unlock(&g_large_lock);
+  return false;
+}
+// Removes p if registered; true when it was.
+bool registry_take(void* p, bool remove) {
+  pthread_mutex_lock(&g_large_lock);
+  unsigned i = slot_of(p);
+  for (int n = 0; n < kLargeSlots; n++, i = (i + 1) % kLargeSlots) {
+    void* s = g_large_slots[i];
+    if (!s) break;
+    if (s == p) {
+      if (remove) g_large_slots[i] = (void*)1;  // tombstone
+      pthread_mutex_unlock(&g_large_lock);
+      return true;
+    }
+  }
+  pthread_mutex_unlock(&g_large_lock);
+  return false;
+}
+pthread_once_t g_heap_once = PTHREAD_ONCE_INIT;
+bool g_large_on = false;
+void heap_range_once() {
+  g_large_on = ytv_lowmem && ytv_lowmem();
+  if (!g_large_on) return;
+  void* probe = malloc(16);
+  SceKernelMemBlockInfo info;
+  memset(&info, 0, sizeof(info));
+  info.size = sizeof(info);
+  if (probe && sceKernelGetMemBlockInfoByAddr(probe, &info) >= 0 && info.mappedBase) {
+    g_heap_lo = (uintptr_t)info.mappedBase;
+    g_heap_hi = g_heap_lo + info.mappedSize;
+  } else {
+    g_large_on = false;  // unknown heap range: never route frees elsewhere
+  }
+  free(probe);
+  char line[120];
+  snprintf(line, sizeof(line), "YTV_LIFECYCLE_LARGE_ALLOC on=%d heap=%p-%p\n", g_large_on ? 1 : 0,
+           (void*)g_heap_lo, (void*)g_heap_hi);
+  SbLogRaw(line);
+}
+inline bool large_enabled() {
+  pthread_once(&g_heap_once, heap_range_once);
+  return g_large_on;
+}
+// A pointer outside the newlib heap was returned by large_alloc().
+inline bool is_large(void* p) {
+  uintptr_t a = (uintptr_t)p;
+  if (!p || !g_large_on || (a >= g_heap_lo && a < g_heap_hi)) return false;
+  return registry_take(p, false);
+}
+void* large_alloc(size_t size) {
+  uint32_t block = (uint32_t)((size + kLargeHeader + 0xFFF) & ~(size_t)0xFFF);
+  SceUID uid = sceKernelAllocMemBlock("YTLargeAlloc", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, block, nullptr);
+  if (uid < 0) return nullptr;
+  void* base = nullptr;
+  if (sceKernelGetMemBlockBase(uid, &base) < 0 || !base) {
+    sceKernelFreeMemBlock(uid);
+    return nullptr;
+  }
+  LargeHeader* h = (LargeHeader*)base;
+  h->magic = kLargeMagic;
+  h->uid = uid;
+  h->size = (uint32_t)size;
+  h->block = block;
+  void* p = (char*)base + kLargeHeader;
+  if (!registry_add(p)) {  // registry full: use the newlib heap instead
+    sceKernelFreeMemBlock(uid);
+    return nullptr;
+  }
+  return p;
+}
+LargeHeader* large_header(void* p) {
+  LargeHeader* h = (LargeHeader*)((char*)p - kLargeHeader);
+  return h->magic == kLargeMagic ? h : nullptr;
+}
+void large_free(void* p) {
+  if (!registry_take(p, true)) return;
+  LargeHeader* h = large_header(p);
+  if (!h) return;  // not ours: leak rather than corrupt
+  SceUID uid = h->uid;
+  h->magic = 0;
+  sceKernelFreeMemBlock(uid);
+}
+}  // namespace
+
+void* SbMemoryAllocateUnchecked(size_t size) {
+  if (size >= kLargeAlloc && large_enabled()) {
+    if (void* p = large_alloc(size)) return p;
+  }
+  return malloc(size);
+}
+void SbMemoryFree(void* memory) {
+  if (is_large(memory)) { large_free(memory); return; }
+  free(memory);
+}
 void* SbMemoryReallocateUnchecked(void* memory, size_t size) {
+  if (!memory) return SbMemoryAllocateUnchecked(size);
+  if (!size) { SbMemoryFree(memory); return nullptr; }
+  if (is_large(memory)) {
+    LargeHeader* h = large_header(memory);
+    size_t old = h ? h->size : 0;
+    if (h && size <= h->block - kLargeHeader && size >= kLargeAlloc) {
+      h->size = (uint32_t)size;  // still fits its memblock
+      return memory;
+    }
+    void* n = SbMemoryAllocateUnchecked(size);
+    if (!n) return nullptr;
+    memcpy(n, memory, old < size ? old : size);
+    large_free(memory);
+    return n;
+  }
+  if (size >= kLargeAlloc && large_enabled()) {
+    if (void* n = large_alloc(size)) {
+      size_t old = malloc_usable_size(memory);
+      memcpy(n, memory, old < size ? old : size);
+      free(memory);
+      return n;
+    }
+  }
   return realloc(memory, size);
 }
 void* SbMemoryAllocateAlignedUnchecked(size_t alignment, size_t size) {
+  // Large blocks are 64-byte aligned (memblock base + 64-byte header).
+  if (size >= kLargeAlloc && alignment <= kLargeHeader && large_enabled()) {
+    if (void* p = large_alloc(size)) return p;
+  }
   return memalign(alignment, size);
 }
-void SbMemoryFree(void* memory) { free(memory); }
-void SbMemoryFreeAligned(void* memory) { free(memory); }
+void SbMemoryFreeAligned(void* memory) { SbMemoryFree(memory); }
 
 extern bool ytv_runtime_trace_is_enabled();
 bool SbSystemGetPath(SbSystemPathId path_id, char* out_path, int path_length) {

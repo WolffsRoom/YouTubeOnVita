@@ -145,13 +145,28 @@ bool SbFileClose(SbFile file){
   free(file);
   return r>=0;
 }
+// SCE I/O calls return 0x8001xxxx error codes. Starboard callers expect -1;
+// sceIoLseek's 64-bit result even carries the code as a *positive* value
+// (0x0000000080010060), which Cobalt then took as a file size and tried to
+// allocate ~2 GiB while loading a certificate (crash at startup).
+void log_io_error(const char* what,long long code){
+  static int count=0;
+  if(count++>=16)return;
+  char line[96];
+  snprintf(line,sizeof(line),"YTV_LIFECYCLE_FILE_ERROR %s 0x%llx\n",what,code);
+  SbLogRaw(line);
+}
 int SbFileRead(SbFile file,char* data,int size){
   if(!file||size<0||(!data&&size>0))return -1;
-  return sceIoRead(file->descriptor,data,size);
+  int r=sceIoRead(file->descriptor,data,size);
+  if(r<0){log_io_error("read",(unsigned)r);return -1;}
+  return r;
 }
 int SbFileWrite(SbFile file,const char* data,int size){
   if(!file||!file->can_write||size<0||(!data&&size>0))return -1;
-  return sceIoWrite(file->descriptor,data,size);
+  int r=sceIoWrite(file->descriptor,data,size);
+  if(r<0){log_io_error("write",(unsigned)r);return -1;}
+  return r;
 }
 int64_t SbFileSeek(SbFile file,SbFileWhence whence,int64_t offset){
   if(!file)return -1;
@@ -159,7 +174,12 @@ int64_t SbFileSeek(SbFile file,SbFileWhence whence,int64_t offset){
            whence==kSbFileFromCurrent?SCE_SEEK_CUR:
            whence==kSbFileFromEnd?SCE_SEEK_END:-1;
   if(kind<0)return -1;
-  return sceIoLseek(file->descriptor,offset,kind);
+  SceOff r=sceIoLseek(file->descriptor,offset,kind);
+  if(r<0 || (r>=0x80000000LL && r<=0xffffffffLL)){  // error code, not an offset
+    log_io_error("seek",(long long)r);
+    return -1;
+  }
+  return r;
 }
 bool SbFileFlush(SbFile file){
   if(!file)return false;

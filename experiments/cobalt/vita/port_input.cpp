@@ -28,10 +28,17 @@
 #include <cstdint>
 
 extern "C" SbWindow ytv_vita_current_window();
+extern "C" bool ytv_addons_input(uint32_t previous, uint32_t current);
+extern "C" bool ytv_addons_menu_open();
+extern "C" void ytv_addons_toggle();
+extern "C" void ytv_addons_tap(float x, float y);
+extern "C" uint32_t ytv_addons_hidden_buttons();
+extern "C" void ytv_ui_sound(int kind);  // port_ui_sound.cpp
 extern "C" void ytv_vita_lifecycle_send(SbEventType type, void* data);
 // Time of the latest press sent to Cobalt; the next presented frame reports
 // the input-to-photon latency (YTV_INPUT_LATENCY, verbose log only).
 extern "C" volatile uint64_t g_ytv_last_input_us;
+extern volatile uint64_t g_ytv_audio_active_us;  // port_addons.cpp
 volatile uint64_t g_ytv_last_input_us = 0;
 
 namespace {
@@ -71,6 +78,28 @@ bool g_tap_active = false;
 bool g_tap_jitter = false;
 float g_tap_x = 0, g_tap_y = 0;
 uint64_t g_tap_release_us = 0;
+
+// Double tap on the left/right third of the screen while a video plays:
+// seek -/+ (YouTube's MediaRewind/MediaFastForward = 10 s steps). The first
+// tap on a side waits kDoubleTapUs before becoming a click.
+constexpr uint64_t kDoubleTapUs = 350000;
+bool g_tap_pending = false;
+uint64_t g_tap_pending_us = 0;
+float g_tap_pending_x = 0, g_tap_pending_y = 0;
+// YouTube's MediaRewind/FastForward open its scrubber (10 s per press, video
+// held); Enter commits. Repeated double taps add up before the commit.
+constexpr uint64_t kSeekCommitUs = 900000;
+uint64_t g_seek_commit_us = 0;
+uint32_t g_seek_dir = 0;      // SCE_CTRL_LEFT / RIGHT
+// Dragging on the lower part of the screen while a video plays scrubs: a
+// D-pad step every kScrubStep pixels (the swipe step is 72 px) and the seek is
+// committed with X after the finger lifts, as for the double tap.
+constexpr float kScrubStep = 26.f;
+constexpr float kScrubZoneY = 300.f;   // progress bar and controls area
+bool g_scrub_touch = false;
+int g_seek_steps = 0;         // D-pad presses still to send
+uint64_t g_seek_next_us = 0;  // when the next one goes out
+constexpr uint64_t kSeekStepUs = 600000;
 
 uint32_t button_by_name(const char* n) {
   struct { const char* name; uint32_t bit; } t[] = {
@@ -129,8 +158,86 @@ void send_touch(SbWindow window, SbInputEventType type, float x, float y) {
   e.size.x = e.size.y = 20.f;
   ytv_vita_lifecycle_send(kSbEventTypeInput, &e);
 }
+void send_media_key(SbWindow window, SbKey key,
+                    SbInputDeviceType device = kSbInputDeviceTypeKeyboard) {
+  for (int i = 0; i < 2; i++) {
+    SbInputData e = {};
+    e.window = window;
+    e.type = i == 0 ? kSbInputEventTypePress : kSbInputEventTypeUnpress;
+    e.device_type = device;
+    e.device_id = 0;
+    e.key = key;
+    ytv_vita_lifecycle_send(kSbEventTypeInput, &e);
+  }
+}
+
+bool video_playing(uint64_t now) {
+  uint64_t a = g_ytv_audio_active_us;
+  return a && (int64_t)(now - a) < 1500000;  // signed: the audio thread may be ahead of now
+}
+
+// -1 left third, +1 right third, 0 middle.
+int tap_side(float x) { return x < 960.f / 3 ? -1 : (x > 960.f * 2 / 3 ? 1 : 0); }
+
+void click_at(SbWindow window, float x, float y) {
+  send_touch(window, kSbInputEventTypePress, x, y);
+  send_touch(window, kSbInputEventTypeUnpress, x, y);
+}
+
+// A finished one-finger tap: click, wait for a second tap, or seek.
+void handle_tap(SbWindow window, uint64_t now, float x, float y) {
+  int side = tap_side(x);
+  if (g_tap_pending) {
+    bool same = tap_side(g_tap_pending_x) == side && now - g_tap_pending_us < kDoubleTapUs;
+    g_tap_pending = false;
+    if (same && side != 0) {
+      // What a user does with the pad (verified in Vita3K: SbPlayerSeek
+      // followed): D-pad shows the controls / steps the scrubber, X commits.
+      // The media FastForward/Rewind keys open a scrubber that X does not
+      // commit. A double tap while the scrubber is open adds one step.
+      const uint32_t dir = side < 0 ? SCE_CTRL_LEFT : SCE_CTRL_RIGHT;
+      if (!g_seek_commit_us || dir != g_seek_dir) {
+        g_seek_dir = dir;
+        g_seek_steps = 2;  // the first press shows the controls
+        g_seek_next_us = now;
+      } else {
+        g_seek_steps++;
+      }
+      g_seek_commit_us = now + (uint64_t)g_seek_steps * kSeekStepUs + kSeekCommitUs;
+      char msg[64];
+      snprintf(msg, sizeof(msg), "YTV_TOUCH_DOUBLE_TAP seek=%s\n", side < 0 ? "back" : "forward");
+      SbLogRaw(msg);
+      return;
+    }
+    click_at(window, g_tap_pending_x, g_tap_pending_y);  // the earlier tap was a click
+  }
+  if (side != 0 && (video_playing(now) || g_seek_commit_us)) {
+    g_tap_pending = true;
+    g_tap_pending_us = now;
+    g_tap_pending_x = x;
+    g_tap_pending_y = y;
+    return;
+  }
+  click_at(window, x, y);
+}
+
 // Front panel: 1920x1088 reporting grid -> 960x544 window pixels.
 void pump_touch(SbWindow window, uint64_t now) {
+  if (g_seek_steps > 0 && (int64_t)(now - g_seek_next_us) >= 0) {
+    gesture_push(g_seek_dir);
+    g_seek_steps--;
+    g_seek_next_us = now + kSeekStepUs;
+  }
+  if (g_seek_commit_us && g_seek_steps == 0 && (int64_t)(now - g_seek_commit_us) >= 0) {
+    g_seek_commit_us = 0;
+    // Commit the scrub with the controller's select button (X), as a user
+    // would; the keyboard Enter only toggled the player controls.
+    gesture_push(SCE_CTRL_CROSS);
+  }
+  if (g_tap_pending && now - g_tap_pending_us >= kDoubleTapUs) {
+    g_tap_pending = false;  // no second tap: it was a click
+    click_at(window, g_tap_pending_x, g_tap_pending_y);
+  }
   SceTouchData t;
   memset(&t, 0, sizeof(t));
   bool have = sceTouchPeek(SCE_TOUCH_PORT_FRONT, &t, 1) > 0;
@@ -173,12 +280,19 @@ void pump_touch(SbWindow window, uint64_t now) {
   if (finger && !g_touch_down) {
     g_press_x = g_anchor_x = x; g_press_y = g_anchor_y = y;
     g_swiped = false;
+    g_scrub_touch = y > kScrubZoneY && (video_playing(now) || g_seek_commit_us);
     g_max_fingers = fingers;
   } else if (finger && g_touch_down) {
     if (fingers > g_max_fingers) g_max_fingers = fingers;
     float dx = x - g_anchor_x, dy = y - g_anchor_y;
     float ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
-    if (g_max_fingers == 1 && ax >= kSwipeStep && ax >= ay) {
+    if (g_max_fingers == 1 && g_scrub_touch && ax >= kScrubStep && ax >= ay * 0.7f) {
+      // Scrub: finger right = forward (like dragging the bar's handle).
+      gesture_push(dx > 0 ? SCE_CTRL_RIGHT : SCE_CTRL_LEFT);
+      g_anchor_x += dx > 0 ? kScrubStep : -kScrubStep;
+      g_anchor_y = y;
+      g_swiped = true;
+    } else if (g_max_fingers == 1 && !g_scrub_touch && ax >= kSwipeStep && ax >= ay) {
       gesture_push(dx < 0 ? SCE_CTRL_RIGHT : SCE_CTRL_LEFT);
       g_anchor_x += dx < 0 ? -kSwipeStep : kSwipeStep;
       g_anchor_y = y;
@@ -190,15 +304,19 @@ void pump_touch(SbWindow window, uint64_t now) {
       g_swiped = true;
     }
   } else if (!finger && g_touch_down) {
+    if (g_scrub_touch && g_swiped) g_seek_commit_us = now + 700000;  // commit the scrub with X
     float dx = g_touch_x - g_press_x, dy = g_touch_y - g_press_y;
     bool still = dx * dx + dy * dy <= (2 * kTapSlop) * (2 * kTapSlop);
     bool tap = !g_swiped && still && g_max_fingers < 2;
-    if (!g_swiped && g_max_fingers >= 2) {
+    if (!g_swiped && g_max_fingers >= 3) {
+      ytv_addons_toggle();  // three-finger tap: add-on menu
+    } else if (!g_swiped && g_max_fingers >= 2) {
       gesture_push(SCE_CTRL_CIRCLE);  // Back
+    } else if (tap && ytv_addons_menu_open()) {
+      ytv_addons_tap(g_press_x, g_press_y);
     } else if (tap) {
-      // A tap: pointer click where the finger went down.
-      send_touch(window, kSbInputEventTypePress, g_press_x, g_press_y);
-      send_touch(window, kSbInputEventTypeUnpress, g_press_x, g_press_y);
+      // A tap: pointer click where the finger went down (or a double tap).
+      handle_tap(window, now, g_press_x, g_press_y);
     }
     char msg[112];
     snprintf(msg, sizeof(msg), "YTV_TOUCH_GESTURE fingers=%d swiped=%d tap=%d at=%d,%d\n",
@@ -211,9 +329,13 @@ void pump_touch(SbWindow window, uint64_t now) {
 }
 }  // namespace
 
+extern "C" bool ytv_osk_active();
 extern "C" int ytv_vita_input_pump() {
   SbWindow window = ytv_vita_current_window();
   if (!SbWindowIsValid(window)) return 0;  // Cobalt has no window yet
+  // Give the system IME exclusive access to the controller and touchscreen.
+  // Otherwise X/O used for typing also activates the YouTube TV player.
+  if (ytv_osk_active()) return 0;
   uint64_t now = sceKernelGetSystemTimeWide();
   if (!g_start_us) {
     g_start_us = now;
@@ -267,10 +389,33 @@ extern "C" int ytv_vita_input_pump() {
   }
   current |= g_gesture_held;
   SbInputData events[16];
-  int count = YtvTranslateVitaButtons(g_previous, current, window, events, 16);
+  // The add-on menu (SELECT) takes the buttons while it is open; Cobalt then
+  // sees no change. Buttons held when it closes are released only after
+  // they are let go (g_previous keeps tracking the real state).
+  static uint32_t s_blocked = 0;
+  if (ytv_addons_input(g_previous, current)) s_blocked |= current;
+  s_blocked &= current;
+  uint32_t visible_prev = g_previous & ~s_blocked, visible_cur = current & ~s_blocked;
+  if (ytv_addons_menu_open()) visible_cur = visible_prev;
+  // L/R switched off in the add-on menu.
+  const uint32_t hidden = ytv_addons_hidden_buttons();
+  visible_prev &= ~hidden;
+  visible_cur &= ~hidden;
+  int count = YtvTranslateVitaButtons(visible_prev, visible_cur, window, events, 16);
   g_previous = current;
   for (int i = 0; i < count; i++) {
-    if (events[i].type == kSbInputEventTypePress) g_ytv_last_input_us = now;
+    if (events[i].type == kSbInputEventTypePress) {
+      g_ytv_last_input_us = now;
+      // Original short UI cues: focus, confirm and back, separate from video audio.
+      const SbKey k = events[i].key;
+      if (k == kSbKeyGamepadDPadUp || k == kSbKeyGamepadDPadDown || k == kSbKeyGamepadDPadLeft ||
+          k == kSbKeyGamepadDPadRight)
+        ytv_ui_sound(1);
+      else if (k == kSbKeyGamepad1)
+        ytv_ui_sound(2);
+      else if (k == kSbKeyGamepad2)
+        ytv_ui_sound(3);
+    }
     ytv_vita_lifecycle_send(kSbEventTypeInput, &events[i]);
   }
   pump_touch(window, now);

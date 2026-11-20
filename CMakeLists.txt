@@ -7,6 +7,10 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   endif()
 endif()
 project(YouTubeVita_OneToOne LANGUAGES C CXX)
+# vita-elf-create appends SCE data (~4.4 KiB) after the R-X segment; with
+# 4 KiB pages the RW segment can start too close ("segment 1 overlaps").
+# 64 KiB alignment always leaves room (every executable here).
+add_link_options(-Wl,-z,max-page-size=0x10000)
 # VitaGL built without the boot splash (same commit as the VitaSDK image).
 option(YTV_VITAGL_NOSPLASH "Link VitaGL built with NO_SPLASHSCREEN=1" ON)
 if(YTV_VITAGL_NOSPLASH)
@@ -21,14 +25,37 @@ if(YTV_BUILD_STARBOARD15_PROBE)
   set(VITA_APP_NAME "Starboard Vita API Test")
   set(VITA_TITLEID "YTVSB0001")
   set(VITA_VERSION "00.02")
-  add_library(starboard_vita15 STATIC "${VITA}/platform15.cpp" "${VITA}/port_window.cpp" "${VITA}/pad_adapter.cpp" "${VITA}/import_lookup.cpp" "${VITA}/port_files.cpp" "${VITA}/port_sync.cpp" "${VITA}/port_network.cpp" "${VITA}/port_socket_waiter.cpp" "${VITA}/port_runtime.cpp" "${VITA}/port_threads.cpp" "${VITA}/port_graphics.cpp" "${VITA}/port_virtual_memory.cpp" "${VITA}/port_storage.cpp" "${VITA}/port_system.cpp" "${VITA}/port_events.cpp" "${VITA}/port_constants.cpp" "${VITA}/port_optional_unsupported.cpp" "${VITA}/port_media_policy.cpp" "${VITA}/port_misc_utility.cpp" "${VITA}/port_audio_sink.cpp" "${VITA}/port_lifecycle.cpp" "${VITA}/port_player.cpp" "${VITA}/port_input.cpp" "${VITA}/port_microphone.cpp")
+  add_library(starboard_vita15 STATIC "${VITA}/platform15.cpp" "${VITA}/port_window.cpp" "${VITA}/pad_adapter.cpp" "${VITA}/import_lookup.cpp" "${VITA}/port_files.cpp" "${VITA}/port_sync.cpp" "${VITA}/port_network.cpp" "${VITA}/port_socket_waiter.cpp" "${VITA}/port_runtime.cpp" "${VITA}/port_threads.cpp" "${VITA}/port_graphics.cpp" "${VITA}/port_virtual_memory.cpp" "${VITA}/port_storage.cpp" "${VITA}/port_system.cpp" "${VITA}/port_events.cpp" "${VITA}/port_constants.cpp" "${VITA}/port_optional_unsupported.cpp" "${VITA}/port_media_policy.cpp" "${VITA}/port_misc_utility.cpp" "${VITA}/port_audio_sink.cpp" "${VITA}/port_lifecycle.cpp" "${VITA}/port_player.cpp" "${VITA}/port_input.cpp" "${VITA}/port_microphone.cpp" "${VITA}/port_addons.cpp" "${VITA}/port_downloads.cpp" "${VITA}/port_native_download.cpp" "${VITA}/port_mp4_aac.cpp" "${VITA}/port_download_metadata.cpp" "${VITA}/port_cover_4x3.cpp" "${VITA}/port_media_session.cpp" "${VITA}/port_osk.cpp" "${VITA}/port_ui_sound.cpp")
   add_executable(ytv_sb15_probe "${VITA}/main_test.cpp")
   option(YTV_GL_TRACE "Diagnostic: log GL calls made through the Starboard GLES table" OFF)
   if(YTV_GL_TRACE)
     target_compile_definitions(starboard_vita15 PRIVATE YTV_GL_TRACE=1)
   endif()
+  # Experimental, audited libcurl 8.21.0 + Mbed TLS transport for native downloads.
+  # Unlike legacy VitaSDK curl/OpenSSL, supports modern verified TLS.
+  option(YTV_NATIVE_HARDENED_CURL "Use pinned Mbed TLS curl instead of VitaSDK OpenSSL" OFF)
+  if(YTV_NATIVE_HARDENED_CURL)
+    set(YTV_HARDENED_CURL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vitube/external/vita-https/build/deps/curl-mbedtls")
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vitube/external/vita-https/build/deps/curl-mbedtls/lib/libcurl.a")
+      message(FATAL_ERROR "Run vita-https/tools/build-curl-mbedtls.sh first")
+    endif()
+    set(YTV_CURL_LIB "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vitube/external/vita-https/build/deps/curl-mbedtls/lib/libcurl.a")
+    set(YTV_CURL_TLS_LIBS mbedtls mbedx509 mbedcrypto)
+    target_include_directories(starboard_vita15 BEFORE PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vitube/external/vita-https/build/deps/curl-mbedtls/include")
+    message(STATUS "Native downloads using hardened curl/Mbed TLS")
+  else()
+    set(YTV_CURL_LIB curl)
+    set(YTV_CURL_TLS_LIBS ssl crypto)
+  endif()
   # Hardware video/audio decoders (SbPlayer) and microphone input.
-  target_link_libraries(starboard_vita15 PUBLIC SceVideodec_stub SceAudiodec_stub SceAudioIn_stub)
+  if(YTV_NATIVE_DOWNLOAD_TEST)
+    target_compile_definitions(starboard_vita15 PRIVATE YTV_NATIVE_DOWNLOAD_TEST=1)
+  endif()
+  target_link_libraries(starboard_vita15 PUBLIC SceVideodec_stub SceAudiodec_stub SceAudioIn_stub SceRtc_stub
+    ${YTV_CURL_LIB} ${YTV_CURL_TLS_LIBS} sodium vitaGL vitashark SceShaccCgExt SceShaccCg_stub taihen_stub
+    SceGxm_stub SceDisplay_stub SceAppUtil_stub SceNet_stub SceNetCtl_stub SceSysmodule_stub
+    ScePower_stub SceCtrl_stub SceTouch_stub SceAudio_stub SceCommonDialog_stub
+    SceAppMgr_stub SceKernelDmacMgr_stub zstd mathneon pthread z m)
   foreach(tgt starboard_vita15 ytv_sb15_probe)
     target_include_directories(${tgt} PRIVATE "${VITA}/include" "${SB}")
     target_compile_options(${tgt} PRIVATE -O2 -Wall -Wextra -Wno-expansion-to-defined -std=gnu++17
@@ -332,23 +359,42 @@ if(YTV_BUILD_AVPLAYER_PROBE)
       FILE experiments/cobalt/vita/assets/vita_avplayer_test.mp4 vita_avplayer_test.mp4)
 endif()
 
-# Stage 17: isolated Cobalt initializer execution, NOT a playable app.
-option(YTV_BUILD_COBALT_BOOT_PROBE "Build isolated native Cobalt init probe" ON)
+# Distribution packages: normal extended-RAM YouTube and a Lite alternative.
+# Both share the same source and version; their title IDs keep them installable
+# side by side. Prefer the normal package unless background apps are important.
+option(YTV_PACKAGE_LITE "Build normal-memory YouTube Lite (YTVCB0002)" OFF)
+option(YTV_BUILD_COBALT_BOOT_PROBE "Build native Cobalt YouTube" ON)
 if(YTV_BUILD_COBALT_BOOT_PROBE)
-  set(VITA_APP_NAME "YouTube")
-  set(VITA_TITLEID "YTVCB0001")
-  set(VITA_VERSION "00.28")
-  add_executable(ytv_cobalt_boot experiments/cobalt/vita/relocate_elf.c)
-  target_compile_definitions(ytv_cobalt_boot PRIVATE YTV_COBALT_BOOT_STAGE=2 YTV_COBALT_DIAG_EVENT_CUTOFF=1)
+  if(YTV_PACKAGE_LITE)
+    set(VITA_APP_NAME "YouTube Lite")
+    set(VITA_TITLEID "YTVCB0002")
+    set(YTV_DISTRIBUTION_VPK "YouTube-Lite.vpk")
+  else()
+    set(VITA_APP_NAME "YouTube")
+    set(VITA_TITLEID "YTVCB0001")
+    set(YTV_DISTRIBUTION_VPK "YouTube.vpk")
+  endif()
+  set(VITA_VERSION "00.58")
+  add_executable(ytv_cobalt_boot experiments/cobalt/vita/relocate_elf.c
+    experiments/cobalt/vita/port_startup_splash.c)
+  target_compile_definitions(ytv_cobalt_boot PRIVATE
+    YTV_COBALT_BOOT_STAGE=2 YTV_COBALT_DIAG_EVENT_CUTOFF=1)
+  if(YTV_PACKAGE_LITE)
+    target_compile_definitions(ytv_cobalt_boot PRIVATE YTV_LOWMEM=1)
+  endif()
   target_compile_options(ytv_cobalt_boot PRIVATE -O2 -Wall -Wextra
     -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -fno-short-enums)
-  target_link_libraries(ytv_cobalt_boot PRIVATE starboard_vita15 kubridge_stub
+  target_link_libraries(ytv_cobalt_boot PRIVATE starboard_vita15 kubridge_stub jpeg png webpdecoder avformat avcodec swresample avutil mp3lame ${YTV_CURL_LIB} ${YTV_CURL_TLS_LIBS} zstd
     vitaGL vitashark SceShaccCgExt SceShaccCg_stub taihen_stub
     SceDisplay_stub SceGxm_stub SceAudio_stub SceKernelDmacMgr_stub
     ScePower_stub SceAppMgr_stub SceCtrl_stub SceTouch_stub
     SceCommonDialog_stub SceIofilemgr_stub SceLibKernel_stub
     SceSysmem_stub SceNet_stub SceNetCtl_stub SceSysmodule_stub SceAppUtil_stub
     SceKernelThreadMgr_stub mathneon pthread z m)
+  # vita-elf-create appends SCE data (~4.4 KiB) after the R-X segment; with
+  # 4 KiB pages the RW segment can start too close ("segment 1 overlaps").
+  # 64 KiB alignment always leaves room.
+  target_link_options(ytv_cobalt_boot PRIVATE -Wl,-z,max-page-size=0x10000)
   vita_create_self(ytv_cobalt_boot.self ytv_cobalt_boot UNSAFE)
   # Package only content actually extracted from the matching official CRX.
   set(COBALT_EXTRACTED_CONTENT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/experiments/cobalt/evergreen/core25/content")
@@ -375,21 +421,40 @@ if(YTV_BUILD_COBALT_BOOT_PROBE)
     get_filename_component(FONT_NAME "${FONT_FILE}" NAME)
     list(APPEND COBALT_BOOT_ASSET_FILES FILE "${FONT_FILE}" "system_fonts/${FONT_NAME}")
   endforeach()
-  # Extended memory mode (+~109 MiB user RAM; param.sfo ATTRIBUTE2=12),
-  # scoped to this package only.
+  # Normal YouTube reserves extended user RAM. Lite uses ordinary mode
+  # for better coexistence with suspended applications/system Settings.
   # vita_create_vpk is a macro: VITA_PACK_VPK_FLAGS / resources from the
   # earlier test VPKs in this file leaked into this package (their legacy
   # icon0.png came first and won over the LiveArea icon). Start clean.
   set(VITA_PACK_VPK_FLAGS "")
   set(resources "")
-  set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
-  vita_create_vpk(CobaltNativeBootstrapTest.vpk ${VITA_TITLEID} ytv_cobalt_boot.self
+  if(YTV_PACKAGE_LITE)
+    unset(VITA_MKSFOEX_FLAGS)
+  else()
+    set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
+  endif()
+  # Match Mozilla CA roots to the modern verified-MbedTLS download transport.
+  set(YTV_COBALT_CA_BUNDLE "experiments/cobalt/vita/ca-bundle.pem")
+  if(YTV_NATIVE_HARDENED_CURL)
+    set(YTV_COBALT_CA_BUNDLE "third_party/vitube/external/vita-https/sources/certifi-2026.07.22-cacert.pem")
+  endif()
+  vita_create_vpk(${YTV_DISTRIBUTION_VPK} ${VITA_TITLEID} ytv_cobalt_boot.self
     VERSION ${VITA_VERSION} NAME ${VITA_APP_NAME}
     FILE assets/livearea/icon0.png sce_sys/icon0.png
     FILE assets/livearea/template.xml sce_sys/livearea/contents/template.xml
-    FILE assets/livearea/labg.png sce_sys/livearea/contents/bg0.png
-    FILE assets/livearea/gate.png sce_sys/livearea/contents/startup.png
+    FILE assets/livearea/bg0.png sce_sys/livearea/contents/bg0.png
+    FILE assets/livearea/startup.png sce_sys/livearea/contents/startup.png
+    FILE experiments/cobalt/vita/assets/splash/youtube_intro_60fps.yspl splash/youtube_intro_60fps.yspl
+    FILE experiments/cobalt/vita/assets/splash/youtube_intro_audio.pcm splash/youtube_intro_audio.pcm
+    FILE experiments/cobalt/vita/assets/sounds/focus.pcm sfx/ui/focus.pcm
+    FILE experiments/cobalt/vita/assets/sounds/confirm.pcm sfx/ui/confirm.pcm
+    FILE experiments/cobalt/vita/assets/sounds/back.pcm sfx/ui/back.pcm
+    FILE experiments/cobalt/vita/assets/sounds/success.pcm sfx/ui/success.pcm
+    FILE experiments/cobalt/vita/assets/sounds/error.pcm sfx/ui/error.pcm
+    FILE experiments/cobalt/vita/assets/sounds/open.pcm sfx/ui/open.pcm
     FILE ${COBALT_CORE} libcobalt.so
+    FILE ${YTV_COBALT_CA_BUNDLE} cacert.pem
     ${COBALT_BOOT_ASSET_FILES})
   unset(VITA_MKSFOEX_FLAGS)
+
 endif()

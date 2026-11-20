@@ -22,11 +22,14 @@
 #include "starboard/mutex.h"
 #include "starboard/condition_variable.h"
 #include <vitaGL.h>
+#include "time_stretch.h"
+extern volatile uint64_t g_ytv_audio_active_us;  // port_addons.cpp: keep-awake
 #include <psp2/videodec.h>
 #include <psp2/audiodec.h>
 #include <psp2/audioout.h>
 #include <psp2/sysmodule.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/gxm.h>
@@ -41,15 +44,45 @@
 #include <set>
 #include <vector>
 
-struct SbDecodeTargetPrivate {
-  SbDecodeTargetInfo info;
+// GPU-mapped decoder output pool. Shared by the player and every decode
+// target whose textures sample it; freed when the last reference goes.
+struct VideoPool {
+  volatile int refs;
+  SceUID mem;
+  void* ptr;
+  bool mapped;
 };
 
+// Decode targets follow the Starboard contract: Cobalt keeps each target it
+// got from SbPlayerGetCurrentFrame (its render-tree images hold the texture
+// ids) until it calls SbDecodeTargetRelease, possibly after the player is
+// gone. A target owns its textures and a pool reference; the player holds one
+// reference to its current target, every GetCurrentFrame adds one.
+struct SbDecodeTargetPrivate {
+  volatile int refs;
+  SbDecodeTargetInfo info;
+  GLuint tex[3];
+  VideoPool* pool;
+};
+
+extern "C" { volatile int g_ytv_player_instances = 0; }
+extern "C" bool ytv_native_player_present() {
+  return __atomic_load_n(&g_ytv_player_instances, __ATOMIC_RELAXED) > 0;
+}
 extern "C" bool ytv_gl_context_is_current();
 // Exported by SceVideodec but missing from the VitaSDK header.
 extern "C" int sceAvcdecDecodeFlush(SceAvcdecCtrl* decoder);
 // Above 1280x720 pixels SceAvcdec only accepts the non-game entry points
 // (the kernel checks the caller's program type). Missing from the headers.
+extern "C" int sceVideodecInitLibraryNongameapp(SceUInt32 codec,
+                                                 const SceVideodecQueryInitInfoHwAvcdec* info);
+extern "C" int ytv_addons_cfg_fhd();  // port_addons.cpp
+extern "C" bool ytv_lowmem();         // port_system.cpp (YouTube Lite)
+// HUD numbers (port_addons.cpp reads them).
+volatile int g_ytv_hud_video_h = 0;
+volatile unsigned g_ytv_hud_dropped_total = 0;
+volatile bool g_ytv_fhd_decoder_created = false;  // read by the Full HD guard
+extern "C" void ytv_addons_fhd_ok();              // port_addons.cpp
 extern "C" int sceAvcdecQueryDecoderMemSizeNongameapp(SceUInt32 codec,
     const SceAvcdecQueryDecoderInfo* query, SceAvcdecDecoderInfo* info);
 extern "C" int sceAvcdecCreateDecoderNongameapp(SceUInt32 codec, SceAvcdecCtrl* ctrl,
@@ -74,6 +107,7 @@ constexpr int kAudioQueueTarget = 24;
 constexpr int kAudioGrain = 1024;            // frames per sceAudioOutOutput
 constexpr int kPcmRingFrames = 48000 * 2;    // up to ~2 s buffered
 constexpr int kAudioThreadPriority = 64;
+constexpr int kWorkerThreadPriority = 96;  // above the UI (128), below audio
 
 void plog(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void plog(const char* fmt, ...) {
@@ -89,8 +123,35 @@ inline int align16(int v) { return (v + 15) & ~15; }
 
 // ---- one-time decoder library initialisation ------------------------------
 pthread_once_t g_libs_once = PTHREAD_ONCE_INIT;
+
+// YouTube Lite: 720p (up to 60 fps) with a crash guard. A probe file exists
+// while a >480p player is open; if it is still there at the next start, that
+// run died with 720p playing, so this run stays at 480p (and removes the
+// probe, so the following start tries 720p again).
+constexpr const char* kLite720Probe = "ux0:data/youtubevita/lite720_probe";
+int g_lite720 = -1;  // -1 unknown, 0 480p max, 1 720p allowed
+bool g_lite720_probe_open = false;
 bool g_video_lib = false, g_audio_lib = false;
 int g_lib_pixels = 0;  // largest picture the initialised video library accepts
+bool g_lib_nongame = false;            // library initialised for 1920x1088
+volatile bool g_fhd_failed = false;    // the non-game decoder produced no pictures
+
+}  // namespace
+extern "C" bool ytv_lowmem_720() {
+  if (g_lite720 >= 0) return g_lite720 == 1;
+  g_lite720 = 0;
+  if (!ytv_lowmem()) return false;
+  SceIoStat st;
+  if (sceIoGetstat(kLite720Probe, &st) >= 0) {
+    sceIoRemove(kLite720Probe);
+    plog("YTV_LIFECYCLE_LITE720 fallback=480p (previous run died with 720p open)\n");
+    return false;
+  }
+  g_lite720 = 1;
+  plog("YTV_LIFECYCLE_LITE720 enabled=1\n");
+  return true;
+}
+namespace {
 void init_libs() {
   sceSysmoduleLoadModule(SCE_SYSMODULE_AVCDEC);
   SceVideodecQueryInitInfoHwAvcdec vinit;
@@ -100,8 +161,21 @@ void init_libs() {
   // (the hardware refuses more); v0.23-v0.25 asked for 1920x1088, which can
   // leave no video decoder at all on a real Vita. Largest accepted size wins.
   int v = -1;
+  // Full HD (Add-ons, experimental): the non-game library accepts 1920x1088.
+  if (ytv_addons_cfg_fhd() && !ytv_lowmem()) {
+    vinit.horizontal = 1920;
+    vinit.vertical = 1088;
+    vinit.numOfRefFrames = 5;
+    vinit.numOfStreams = 1;
+    v = sceVideodecInitLibraryNongameapp(SCE_VIDEODEC_TYPE_HW_AVCDEC, &vinit);
+    plog("YTV_LIFECYCLE_PLAYER_VIDEODEC_INIT nongame 1920x1088 r=0x%x\n", (unsigned)v);
+    if (v >= 0) { g_lib_pixels = 1920 * 1088; g_lib_nongame = true; }
+  }
   const Tier lib_sizes[] = {{1280, 720}, {864, 480}};
   for (const Tier& t : lib_sizes) {
+    if (g_lib_nongame) break;
+    // YouTube Lite plays 480p at most: smaller library and decoder memory.
+    if (ytv_lowmem() && !ytv_lowmem_720() && t.w > 864) continue;
     vinit.horizontal = (uint32_t)t.w;
     vinit.vertical = (uint32_t)t.h;
     vinit.numOfRefFrames = 5;
@@ -198,7 +272,18 @@ struct SbPlayerPrivate {
   Frame frames[kFramePool];
   std::multiset<int64_t> pending_pts;
   int total_frames, dropped_frames;
+  // Playback statistics (YTV_LIFECYCLE_PLAYER_STATS, always logged).
+  int shown_frames, frame_calls, backwards;
+  uint32_t serial;  // unique per player (addresses get reused)
+  uint64_t decode_us;
   int64_t last_video_pts;
+  // Video the hardware decoder refuses (UNSUPPORT_IMAGE_SIZE, e.g. the
+  // 720x720 stream of YouTube Music's lyrics view): one retry with a decoder
+  // sized exactly for the stream, then audio-only playback.
+  int size_errors;
+  int fhd_errors;
+  bool size_retry_done;
+  bool video_broken;
 
   // Audio decode/output.
   int channels, sample_rate;
@@ -216,6 +301,14 @@ struct SbPlayerPrivate {
   int64_t audio_base_pts;
   bool audio_base_set;
   uint64_t frames_played;
+  // Smooth audio clock: frames_played advances in 1024-frame steps (23 ms);
+  // between steps the clock is interpolated with the system timer, capped at
+  // one step, and never goes backwards. A stepped clock made 24/30 fps video
+  // alternate between 1, 2 and 3 refreshes per frame on hardware.
+  uint64_t clock_update_us;
+  uint32_t audio_epoch;      // bumped on seek: the audio thread resets its state
+  int64_t clock_step_us;
+  int64_t last_media;
 
   // Video-only clock.
   int64_t wall_base_pts;
@@ -223,11 +316,11 @@ struct SbPlayerPrivate {
   bool clock_running;
 
   // GL output (rasterizer thread only).
-  GLuint textures[3];
+  VideoPool* pool;               // player's reference
+  SbDecodeTargetPrivate* cur;    // player's reference (textures for the stream size)
   int tex_pitch, tex_height;
   int64_t uploaded_pts;
   bool have_target;
-  SbDecodeTargetPrivate target;
 };
 
 namespace {
@@ -239,7 +332,17 @@ int64_t media_time_locked(SbPlayer p) {
     return p->seek_to;
   if (p->has_audio) {
     if (!p->audio_base_set) return p->seek_to;
-    return p->audio_base_pts + (int64_t)(p->frames_played * 1000000ull / (uint64_t)p->sample_rate);
+    int64_t t = p->audio_base_pts + (int64_t)(p->frames_played * 1000000ull / (uint64_t)p->sample_rate);
+    if (p->rate > 0.0 && p->state == kSbPlayerStatePresenting && p->clock_update_us) {
+      // clock_step_us is the real duration of the last block; media time
+      // advances rate times faster (playback speed).
+      int64_t extra = (int64_t)(now_us() - p->clock_update_us);
+      if (extra > p->clock_step_us) extra = p->clock_step_us;
+      if (extra > 0) t += (int64_t)((double)extra * p->rate);
+    }
+    if (t < p->last_media) t = p->last_media;
+    p->last_media = t;
+    return t;
   }
   if (!p->clock_running) return p->wall_base_pts;
   return p->wall_base_pts + (int64_t)((now_us() - p->wall_start_us) * p->rate);
@@ -272,6 +375,85 @@ void log_free_memory(const char* when) {
 void release_frame_pool(SceUID mem, void* pool, bool mapped) {
   if (mapped && pool) sceGxmUnmapMemory(pool);
   if (mem >= 0) sceKernelFreeMemBlock(mem);
+}
+
+void pool_unref(VideoPool* pool) {
+  if (pool && __sync_sub_and_fetch(&pool->refs, 1) == 0) {
+    release_frame_pool(pool->mem, pool->ptr, pool->mapped);
+    delete pool;
+  }
+}
+
+// Targets nobody references any more wait here for the GPU: deleted on the
+// GL thread 3 presented frames later (ytv_player_on_swap), or right away
+// after a glFinish (flush_dead_targets).
+SbMutex g_dead_mutex = SB_MUTEX_INITIALIZER;
+struct DeadTarget { SbDecodeTargetPrivate* t; uint32_t due; };
+std::vector<DeadTarget> g_dead;
+volatile uint32_t g_swaps = 0;
+volatile int g_live_targets = 0, g_dead_count = 0;  // diagnostics
+
+void target_unref(SbDecodeTargetPrivate* t) {
+  if (!t || __sync_sub_and_fetch(&t->refs, 1) != 0) return;
+  SbMutexAcquire(&g_dead_mutex);
+  g_dead.push_back({t, g_swaps + 3});
+  g_dead_count = (int)g_dead.size();
+  SbMutexRelease(&g_dead_mutex);
+}
+
+// GL thread only. all=true: everything queued (the caller did glFinish).
+void free_dead_targets(bool all) {
+  std::vector<SbDecodeTargetPrivate*> ready;
+  SbMutexAcquire(&g_dead_mutex);
+  for (size_t i = 0; i < g_dead.size();) {
+    if (all || (int32_t)(g_swaps - g_dead[i].due) >= 0) {
+      ready.push_back(g_dead[i].t);
+      g_dead[i] = g_dead.back();
+      g_dead.pop_back();
+    } else {
+      i++;
+    }
+  }
+  g_dead_count = (int)g_dead.size();
+  SbMutexRelease(&g_dead_mutex);
+  for (SbDecodeTargetPrivate* t : ready) {
+    __sync_sub_and_fetch(&g_live_targets, 1);
+    if (t->tex[0]) glDeleteTextures(3, t->tex);
+    pool_unref(t->pool);
+    delete t;
+  }
+}
+
+bool dead_targets_pending() {
+  SbMutexAcquire(&g_dead_mutex);
+  bool any = !g_dead.empty();
+  SbMutexRelease(&g_dead_mutex);
+  return any;
+}
+
+void flush_dead_targets(void*) {
+  glFinish();
+  free_dead_targets(true);
+}
+
+SbDecodeTargetPrivate* new_target(VideoPool* pool, int pitch, int h16) {
+  SbDecodeTargetPrivate* t = new SbDecodeTargetPrivate();
+  t->refs = 1;  // the player's
+  __sync_add_and_fetch(&g_live_targets, 1);
+  t->pool = pool;
+  __sync_add_and_fetch(&pool->refs, 1);
+  glGenTextures(3, t->tex);
+  for (int i = 0; i < 3; i++) {
+    int w = i == 0 ? pitch : pitch / 2;
+    int h = i == 0 ? h16 : h16 / 2;
+    glBindTexture(GL_TEXTURE_2D, t->tex[i]);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, w, h, 0, GL_ALPHA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  }
+  return t;
 }
 
 bool try_create_decoder(SbPlayer p, int cap_w, int cap_h) {
@@ -314,6 +496,7 @@ bool try_create_decoder(SbPlayer p, int cap_w, int cap_h) {
   p->frame_pool = pool;
   p->frame_pool_size = pool_size;
   p->frame_pool_mapped = true;
+  p->pool = new VideoPool{1, pool_mem, pool, true};
   for (int i = 0; i < kFramePool; i++) {
     p->frames[i].data = i < frames ? static_cast<uint8_t*>(pool) + (size_t)frame_bytes * i : nullptr;
     p->frames[i].used = false;  // slots beyond the pool have no data: never free
@@ -323,6 +506,7 @@ bool try_create_decoder(SbPlayer p, int cap_w, int cap_h) {
   p->height16 = cap_h;
   p->displayed = -1;
   p->avc_ready = true;
+  if (cap_w * cap_h > kGamePixelLimit) g_ytv_fhd_decoder_created = true;
   plog("YTV_LIFECYCLE_PLAYER_DECODER capacity=%dx%d ref=%uKiB pool=%uKiB\n", cap_w, cap_h,
        (unsigned)(need.frameMemSize / 1024), (unsigned)(pool_size / 1024));
   return true;
@@ -333,6 +517,7 @@ bool try_create_decoder(SbPlayer p, int cap_w, int cap_h) {
 // decoder accepted by the system and enough device memory for it).
 extern "C" bool ytv_player_can_decode_1080p() {
   pthread_once(&g_libs_once, init_libs);
+  if (!g_lib_nongame || g_fhd_failed) return false;
   SceAvcdecQueryDecoderInfo query = {1920, 1088, 5};
   SceAvcdecDecoderInfo need;
   memset(&need, 0, sizeof(need));
@@ -353,6 +538,8 @@ bool create_video_decoder(SbPlayer p, int need_w, int need_h) {
   log_free_memory("before_decoder");
   for (const Tier& t : kTiers) {
     if (t.w < need_w || t.h < need_h) continue;
+    // 1080p decoders only with the Full HD option (non-game library ready).
+    if (t.w * t.h > kGamePixelLimit && (!g_lib_nongame || g_fhd_failed)) continue;
     if (t.w * t.h <= kGamePixelLimit && t.w * t.h > g_lib_pixels) continue;
     if (try_create_decoder(p, t.w, t.h)) return true;
   }
@@ -368,6 +555,7 @@ void destroy_video_decoder(SbPlayer p) {
 
 // Decodes one sample into a free frame slot. Returns false if no slot.
 bool decode_video_sample(SbPlayer p, const Sample& s) {
+  if (p->video_broken) return true;  // consumed: audio-only playback
   int slot = -1;
   for (int i = 0; i < kFramePool; i++)
     if (frame_free(p->frames[i])) { slot = i; break; }
@@ -402,16 +590,58 @@ bool decode_video_sample(SbPlayer p, const Sample& s) {
   memset(&array, 0, sizeof(array));
   array.numOfElm = 1;
   array.pPicture = pics;
+  uint64_t dec_t0 = sceKernelGetSystemTimeWide();
   int r = sceAvcdecDecode(&p->avc, &au, &array);
+  p->decode_us += sceKernelGetSystemTimeWide() - dec_t0;
   p->pending_pts.insert(s.timestamp);
   if (r < 0) {
-    plog("YTV_PLAYER avcdec decode error 0x%x size=%d\n", (unsigned)r, s.size);
+    static int decode_errors = 0;  // always logged (first few): explains silent video
+    if (decode_errors++ < 8)
+      plog("YTV_LIFECYCLE_PLAYER avcdec decode error 0x%x size=%d layout=%dx%d stream=%dx%d\n",
+           (unsigned)r, s.size, lw, lh, p->stream_width, p->stream_height);
+    if (p->pitch * p->height16 > kGamePixelLimit && p->total_frames == 0 && ++p->fhd_errors >= 5 &&
+        !g_fhd_failed) {
+      g_fhd_failed = true;  // CanPlay stops offering 1080p; this player goes audio-only
+      p->video_broken = true;
+      plog("YTV_LIFECYCLE_PLAYER fhd decoder failed (0x%x): Full HD disabled for this run\n",
+           (unsigned)r);
+    }
+    if ((unsigned)r == (unsigned)SCE_AVCDEC_ERROR_UNSUPPORT_IMAGE_SIZE && ++p->size_errors >= 3) {
+      p->size_errors = 0;
+      bool retried = false;
+      if (!p->size_retry_done && (lw != p->pitch || lh != p->height16)) {
+        // Decoder with the stream's exact (16-aligned) size.
+        p->size_retry_done = true;
+        destroy_video_decoder(p);
+        pool_unref(p->pool);  // nothing decoded from it is on screen yet
+        p->pool = nullptr;
+        p->pending_pts.clear();
+        retried = try_create_decoder(p, lw, lh);
+        plog("YTV_LIFECYCLE_PLAYER size_retry capacity=%dx%d ok=%d\n", lw, lh, (int)retried);
+      }
+      if (!retried) {
+        p->video_broken = true;
+        plog("YTV_LIFECYCLE_PLAYER video %dx%d unsupported by the decoder: audio only\n", lw, lh);
+      }
+    }
     return true;  // sample consumed; the stream may recover at the next key frame
   }
   if (array.numOfOutput > 0 && !p->pending_pts.empty()) {
-    // Output comes in display order: it is the smallest pending timestamp.
-    f.pts = *p->pending_pts.begin();
-    p->pending_pts.erase(p->pending_pts.begin());
+    // Use the timestamp the decoder attaches to the output picture (the pts
+    // of the access unit it came from). Assuming "smallest pending pts" put
+    // B-frames out of order on hardware (the image jumped back and forth at
+    // full frame rate). Fall back to that guess only if the decoder returns
+    // a timestamp that matches no submitted sample.
+    int64_t out_pts = (int64_t)(((uint64_t)pic.info.pts.upper << 32) | pic.info.pts.lower);
+    auto it = p->pending_pts.find(out_pts);
+    if (it == p->pending_pts.end()) {
+      static int mismatches = 0;
+      if (mismatches++ < 4)
+        plog("YTV_LIFECYCLE_PLAYER pts_fallback decoder=%lld\n", (long long)out_pts);
+      it = p->pending_pts.begin();
+    }
+    f.pts = *it;
+    p->pending_pts.erase(it);
     f.pitch = lw;
     f.h16 = lh;
     f.width = pic.frame.horizontalSize ? (int)pic.frame.horizontalSize : lw;
@@ -420,6 +650,8 @@ bool decode_video_sample(SbPlayer p, const Sample& s) {
     if (f.height > lh) f.height = lh;
     f.used = true;
     p->total_frames++;
+    g_ytv_hud_video_h = f.height;
+    if (p->pitch * p->height16 > kGamePixelLimit && p->total_frames == 30) ytv_addons_fhd_ok();
     if (f.pts > p->last_video_pts) p->last_video_pts = f.pts;
   }
   return true;
@@ -551,9 +783,70 @@ int audio_output_thread(SceSize, void* argp) {
                       SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0666);
     }
   }
+  // Playback speed (WSOLA): used whenever rate != 1.
+  WsolaStretcher* stretch = new WsolaStretcher();
+  double stretch_rate = 1.0;
+  uint32_t stretch_epoch = 0;
   while (!p->stopping) {
     SbMutexAcquire(&p->mutex);
     bool playing = p->state == kSbPlayerStatePresenting && p->rate > 0.0 && !p->seek_pending;
+    if (playing && p->rate != 1.0) {
+      // ---- speed path: pull input into the stretcher, emit two hops ----
+      double rate = p->rate;
+      if (rate != stretch_rate || p->audio_epoch != stretch_epoch) {
+        stretch->Reset();
+        stretch_rate = rate;
+        stretch_epoch = p->audio_epoch;
+      }
+      bool draining = p->audio_eos_in && p->audio_in.empty();
+      int want = stretch->NeededForHop() + (int)(rate * WsolaStretcher::kHop) + 8 -
+                 stretch->Buffered();
+      int pull = want > 0 ? want : 0;
+      if (pull > p->ring_count) pull = p->ring_count;
+      if (pull > stretch->Space()) pull = stretch->Space();
+      static int16_t tmp[2 * 4096];
+      int pulled = 0;
+      while (pulled < pull) {
+        int chunk = pull - pulled > 4096 ? 4096 : pull - pulled;
+        for (int i = 0; i < chunk; i++) {
+          int rd = (p->ring_read + i) % kPcmRingFrames;
+          tmp[2 * i] = p->ring[2 * rd];
+          tmp[2 * i + 1] = p->ring[2 * rd + 1];
+        }
+        p->ring_read = (p->ring_read + chunk) % kPcmRingFrames;
+        p->ring_count -= chunk;
+        stretch->Push(tmp, chunk);
+        pulled += chunk;
+      }
+      int volume = (int)(p->volume * SCE_AUDIO_VOLUME_0DB);
+      SbMutexRelease(&p->mutex);
+      if (volume != last_volume) {
+        int v[2] = {volume, volume};
+        sceAudioOutSetVolume(p->port,
+            (SceAudioOutChannelFlag)(SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH), v);
+        last_volume = volume;
+      }
+      int c1 = stretch->Hop((float)rate, block);
+      int c2 = c1 >= 0 ? stretch->Hop((float)rate, block + 2 * WsolaStretcher::kHop) : -1;
+      if (c1 < 0 || c2 < 0) {
+        (void)draining;  // tail shorter than a frame at EOS is dropped
+        SbConditionVariableSignal(&p->cond);
+        sceKernelDelayThread(4000);
+        continue;
+      }
+      sceAudioOutOutput(p->port, block);
+      g_ytv_audio_active_us = now_us();
+      if (rec >= 0) sceIoWrite(rec, block, sizeof(block));
+      SbMutexAcquire(&p->mutex);
+      if (!p->seek_pending && p->audio_epoch == stretch_epoch) {
+        p->frames_played += (uint64_t)(c1 + c2);  // media frames consumed
+        p->clock_update_us = now_us();
+        p->clock_step_us = (int64_t)kAudioGrain * 1000000 / p->sample_rate;  // real time
+      }
+      SbMutexRelease(&p->mutex);
+      SbConditionVariableSignal(&p->cond);
+      continue;
+    }
     int avail = p->ring_count;
     bool draining = p->audio_eos_in && p->audio_in.empty();
     int take = 0;
@@ -582,14 +875,20 @@ int audio_output_thread(SceSize, void* argp) {
     }
     for (int i = take; i < kAudioGrain; i++) block[2 * i] = block[2 * i + 1] = 0;
     sceAudioOutOutput(p->port, block);
+      g_ytv_audio_active_us = now_us();
     if (rec >= 0) sceIoWrite(rec, block, sizeof(block));
     SbMutexAcquire(&p->mutex);
-    if (!p->seek_pending) p->frames_played += (uint64_t)take;
+    if (!p->seek_pending) {
+      p->frames_played += (uint64_t)take;
+      p->clock_update_us = now_us();
+      p->clock_step_us = (int64_t)take * 1000000 / p->sample_rate;
+    }
     SbMutexRelease(&p->mutex);
     SbConditionVariableSignal(&p->cond);
   }
   sceAudioOutOutput(p->port, nullptr);
   if (rec >= 0) sceIoClose(rec);
+  delete stretch;
   return 0;
 }
 void* audio_output_pthread(void* arg) {
@@ -602,6 +901,11 @@ void* audio_output_pthread(void* arg) {
 // ---- worker ---------------------------------------------------------------
 void* worker_main(void* arg) {
   SbPlayer p = static_cast<SbPlayer>(arg);
+  // The worker holds p->mutex while it decodes. At the default priority the
+  // UI thread (MainWebModule, 128) preempted it during heavy pages, and the
+  // audio thread (64) then waited on the mutex: audio stutter whenever the
+  // player controls / suggestions were on screen (v0.39 hardware log).
+  sceKernelChangeThreadPriority(0, kWorkerThreadPriority);
   std::vector<const void*> to_free;
   while (!p->stopping) {
     bool did_work = false;
@@ -623,6 +927,9 @@ void* worker_main(void* arg) {
       p->ring_read = p->ring_count = 0;
       p->frames_played = 0;
       p->audio_base_set = false;
+      p->clock_update_us = 0;
+      p->last_media = INT64_MIN;
+      p->audio_epoch++;
       p->wall_base_pts = p->seek_to;
       p->clock_running = false;
       p->video_eos_in = p->audio_eos_in = false;
@@ -658,7 +965,7 @@ void* worker_main(void* arg) {
       Sample s = p->video_in.front();
       bool free_slot = false;
       for (auto& f : p->frames) if (frame_free(f)) free_slot = true;
-      if (free_slot) {
+      if (free_slot || p->video_broken) {
         p->video_in.pop_front();
         decode_video_sample(p, s);
         to_free.push_back(s.buffer);
@@ -677,7 +984,7 @@ void* worker_main(void* arg) {
     // Preroll -> presenting.
     bool start_presenting = false;
     if (p->state == kSbPlayerStatePrerolling) {
-      bool video_ready = !p->has_video || p->video_eos_in;
+      bool video_ready = !p->has_video || p->video_eos_in || p->video_broken;
       for (auto& f : p->frames) if (f.used) video_ready = true;
       bool audio_ready = !p->has_audio || p->ring_count >= p->sample_rate / 4 ||
                          (p->audio_eos_in && p->audio_in.empty());
@@ -686,6 +993,30 @@ void* worker_main(void* arg) {
         p->wall_start_us = now_us();
         p->clock_running = true;
         start_presenting = true;
+      }
+    }
+    {  // playback statistics every 5 s while playing (always logged)
+      static uint64_t last_stats = 0;
+      static int prev_dec = 0, prev_shown = 0, prev_drop = 0, prev_calls = 0;
+      static uint64_t prev_dec_us = 0;
+      static uint32_t prev_serial = 0;
+      if (prev_serial != p->serial) {  // counters are per player
+        prev_serial = p->serial; prev_dec = prev_shown = prev_drop = prev_calls = 0; prev_dec_us = 0;
+      }
+      uint64_t nowt = now_us();
+      if (p->has_video && p->state == kSbPlayerStatePresenting && nowt - last_stats > 5000000) {
+        last_stats = nowt;
+        int free_slots = 0;
+        for (auto& f : p->frames) if (frame_free(f)) free_slots++;
+        plog("YTV_LIFECYCLE_PLAYER_STATS media_ms=%lld rate=%.1f decoded=%d shown=%d dropped=%d "
+             "frame_calls=%d backwards=%d dec_ms=%llu free=%d vin=%d ring=%d stream=%dx%d targets=%d dead=%d\n",
+             (long long)(media_time_locked(p) / 1000), p->rate, p->total_frames - prev_dec,
+             p->shown_frames - prev_shown, p->dropped_frames - prev_drop,
+             p->frame_calls - prev_calls, p->backwards, (unsigned long long)((p->decode_us - prev_dec_us) / 1000),
+             free_slots, (int)p->video_in.size(), p->ring_count, p->stream_width, p->stream_height,
+             (int)g_live_targets, (int)g_dead_count);
+        prev_dec = p->total_frames; prev_shown = p->shown_frames; prev_drop = p->dropped_frames;
+        prev_calls = p->frame_calls; prev_dec_us = p->decode_us;
       }
     }
     {  // diagnostic heartbeat (dropped from the log unless verbose.txt)
@@ -739,6 +1070,7 @@ void upload_current(void* arg) {
   SbPlayer p = job->player;
   job->result = kSbDecodeTargetInvalid;
   SbMutexAcquire(&p->mutex);
+  p->frame_calls++;
   int64_t t = media_time_locked(p);
   int best = -1;
   for (int i = 0; i < kFramePool; i++) {
@@ -750,19 +1082,12 @@ void upload_current(void* arg) {
   }
   if (best >= 0 && p->frames[best].pts != p->uploaded_pts) {
     Frame& f = p->frames[best];
-    if (!p->textures[0] || p->tex_pitch != p->pitch || p->tex_height != p->height16) {
-      if (p->textures[0]) glDeleteTextures(3, p->textures);
-      glGenTextures(3, p->textures);
-      for (int i = 0; i < 3; i++) {
-        int w = i == 0 ? p->pitch : p->pitch / 2;
-        int h = i == 0 ? p->height16 : p->height16 / 2;
-        glBindTexture(GL_TEXTURE_2D, p->textures[i]);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, w, h, 0, GL_ALPHA, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-      }
+    if (!p->cur || p->tex_pitch != p->pitch || p->tex_height != p->height16) {
+      // New size: new textures in a new target. Images Cobalt still holds
+      // keep the old one (and its texture ids) until they are released.
+      SbDecodeTargetPrivate* old = p->cur;
+      p->cur = new_target(p->pool, p->pitch, p->height16);
+      target_unref(old);
       p->tex_pitch = p->pitch;
       p->tex_height = p->height16;
     }
@@ -770,28 +1095,41 @@ void upload_current(void* arg) {
     const uint8_t* u = y + (size_t)f.pitch * f.h16;
     const uint8_t* v = u + (size_t)(f.pitch / 2) * (f.h16 / 2);
     const uint8_t* planes[3] = {y, u, v};
+    // Cobalt caches GL binding state across DecodeTarget callbacks. These
+    // binds are VIDEO-ONLY and must never leak into the caller's rasterizer
+    // state. Previously this function ended with glBindTexture(..., 0)
+    // 24-60 times/sec: after navigating videos, Cobalt's texture cache could
+    // still think an UI texture was bound while VitaGL was bound to 0.
+    GLint previous_texture=0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D,&previous_texture);
     // Zero copy: point each texture's GXM descriptor at the decoder plane.
     // vitaGL keeps (and later frees) its own allocation in tex->data.
     // vitaGL creates textures swizzled; decoder planes are linear rasters, so
     // the descriptor is rebuilt as linear (same format, pitch-wide rows).
     for (int i = 0; i < 3; i++) {
-      glBindTexture(GL_TEXTURE_2D, p->textures[i]);
+      glBindTexture(GL_TEXTURE_2D, p->cur->tex[i]);
       SceGxmTexture* gxm = vglGetGxmTexture(GL_TEXTURE_2D);
       if (!gxm) continue;
       SceGxmTextureFormat fmt = sceGxmTextureGetFormat(gxm);
+      // Linear texture covering the decoder's full layout (pitch x h16).
+      // (Strided textures with the exact picture size would be ideal, but
+      // vitaGL rewrites the mip/filter control bits on every draw, which hold
+      // the stride of a strided texture.)
       int w = i == 0 ? f.pitch : f.pitch / 2;
       int h = i == 0 ? f.h16 : f.h16 / 2;
       sceGxmTextureInitLinear(gxm, planes[i], fmt, (unsigned)w, (unsigned)h, 0);
     }
-    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)previous_texture);
     // The previous frame leaves the screen; the GPU may read it for a while.
     if (p->displayed >= 0 && p->displayed != best) {
       p->frames[p->displayed].used = false;
       p->frames[p->displayed].retired_at = vglGetFrameNumber();
     }
     p->displayed = best;
+    p->shown_frames++;
+    if (p->uploaded_pts >= 0 && f.pts < p->uploaded_pts) p->backwards++;  // shown out of order
     p->uploaded_pts = f.pts;
-    SbDecodeTargetInfo& info = p->target.info;
+    SbDecodeTargetInfo& info = p->cur->info;
     memset(&info, 0, sizeof(info));
     info.format = kSbDecodeTargetFormat3PlaneYUVI420;
     info.is_opaque = true;
@@ -799,15 +1137,19 @@ void upload_current(void* arg) {
     info.height = f.height;
     for (int i = 0; i < 3; i++) {
       SbDecodeTargetInfoPlane& pl = info.planes[i];
-      pl.texture = p->textures[i];
+      pl.texture = p->cur->tex[i];
       pl.gl_texture_target = GL_TEXTURE_2D;
       pl.gl_texture_format = GL_ALPHA;
+      // The content region must cover the whole texture: with a sub-region
+      // (e.g. 854 of a 864 pitch) Cobalt's region transform assumes a
+      // bottom-up origin and the video showed upside down. The macroblock
+      // padding (<= 15 px of edge content) is therefore shown, scaled.
       pl.width = i == 0 ? f.pitch : f.pitch / 2;
       pl.height = i == 0 ? f.h16 : f.h16 / 2;
       pl.content_region.left = 0;
       pl.content_region.top = 0;
-      pl.content_region.right = i == 0 ? f.width : f.width / 2.f;
-      pl.content_region.bottom = i == 0 ? f.height : f.height / 2.f;
+      pl.content_region.right = pl.width;
+      pl.content_region.bottom = pl.height;
     }
     p->have_target = true;
   }
@@ -817,12 +1159,16 @@ void upload_current(void* arg) {
       if (i != best && i != p->displayed && p->frames[i].used &&
           p->frames[i].pts <= p->frames[best].pts) {
         p->dropped_frames++;
+        g_ytv_hud_dropped_total++;
         p->frames[i].used = false;
         p->frames[i].retired_at = 0;  // never sampled by the GPU
       }
     }
   }
-  if (p->have_target) job->result = &p->target;
+  if (p->have_target && p->cur) {
+    __sync_add_and_fetch(&p->cur->refs, 1);  // released by SbDecodeTargetRelease
+    job->result = p->cur;
+  }
   SbMutexRelease(&p->mutex);
   SbConditionVariableSignal(&p->cond);
 }
@@ -843,6 +1189,10 @@ SbPlayer SbPlayerCreate(SbWindow window, const SbPlayerCreationParam* param,
                         SbDecodeTargetGraphicsContextProvider* provider) {
   (void)window;
   if (!param || !decoder_status || !player_status || !deallocate) return kSbPlayerInvalid;
+  plog("YTV_PLAYER_CREATE_ENTER video_codec=%d audio_codec=%d dims=%dx%d pending_targets=%d\n",
+       (int)param->video_stream_info.codec, (int)param->audio_stream_info.codec,
+       (int)param->video_stream_info.frame_width, (int)param->video_stream_info.frame_height,
+       (int)g_dead_count);
   if (param->drm_system != kSbDrmSystemInvalid) return kSbPlayerInvalid;
   if (param->output_mode != kSbPlayerOutputModeDecodeToTexture) return kSbPlayerInvalid;
   pthread_once(&g_libs_once, init_libs);
@@ -868,11 +1218,32 @@ SbPlayer SbPlayerCreate(SbWindow window, const SbPlayerCreationParam* param,
   p->rate = 1.0;
   p->volume = 1.0;
   p->avc_mem = p->frame_mem = -1;
+  p->pool = nullptr;
+  p->cur = nullptr;
+  // Free decoder pools of finished players now (glFinish on the GL thread),
+  // so the new decoder finds their CDRAM/phycont.
+  if (dead_targets_pending()) {
+    // On quick 720p -> 480p switches Cobalt can call SbPlayerCreate while the
+    // rasterizer's GL context runner is waiting on the same media pipeline.
+    // Running a synchronous GL callback here stalls both threads and the UI.
+    // Dead targets are already retired after three presented frames in
+    // ytv_player_on_swap(); do not wait for the rasterizer from media thread.
+    if (ytv_gl_context_is_current()) {
+      flush_dead_targets(nullptr);
+    } else {
+      plog("YTV_PLAYER_CREATE deferred_GL_cleanup pending=%d swaps=%u\n",
+           (int)g_dead_count, (unsigned)g_swaps);
+    }
+  }
   p->displayed = -1;
   p->port = -1;
   p->audio_thread_running = false;
   p->last_video_pts = -1;
   p->uploaded_pts = -1;
+  {
+    static volatile uint32_t next_serial = 0;
+    p->serial = __sync_add_and_fetch(&next_serial, 1);
+  }
 
   bool ok = true;
   if (has_video) {
@@ -898,7 +1269,8 @@ SbPlayer SbPlayerCreate(SbWindow window, const SbPlayerCreationParam* param,
        p->stream_width, p->stream_height, has_audio, p->channels, p->sample_rate, ok);
   if (!ok) {
     destroy_video_decoder(p);
-    release_frame_pool(p->frame_mem, p->frame_pool, p->frame_pool_mapped);
+    if (p->pool) pool_unref(p->pool);  // never displayed: no GPU reads
+    else release_frame_pool(p->frame_mem, p->frame_pool, p->frame_pool_mapped);
     if (p->aac_ready) sceAudiodecDeleteDecoder(&p->aac);
     if (p->port >= 0) sceAudioOutReleasePort(p->port);
     free(p->es_buffer); free(p->pcm_buffer); free(p->ring);
@@ -919,49 +1291,51 @@ SbPlayer SbPlayerCreate(SbWindow window, const SbPlayerCreationParam* param,
     pthread_attr_destroy(&attr);
   }
   report_state(p, kSbPlayerStateInitialized, SB_PLAYER_INITIAL_TICKET);
+  __sync_add_and_fetch(&g_ytv_player_instances, 1);
+  if (ytv_lowmem() && p->stream_height > 480 && !g_lite720_probe_open) {
+    SceUID fd = sceIoOpen(kLite720Probe, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+    if (fd >= 0) { sceIoWrite(fd, "1", 1); sceIoClose(fd); g_lite720_probe_open = true; }
+  }
   return p;
 }
 
 void SbPlayerDestroy(SbPlayer p) {
   if (!p) return;
+  plog("YTV_PLAYER_DESTROY_BEGIN id=%u dims=%dx%d pending=%d live=%d\n",
+       p->serial, p->stream_width, p->stream_height, (int)g_dead_count,
+       (int)g_live_targets);
+  __sync_sub_and_fetch(&g_ytv_player_instances, 1);
+  if (g_lite720_probe_open && p->stream_height > 480) {
+    sceIoRemove(kLite720Probe);
+    g_lite720_probe_open = false;
+  }
   p->stopping = true;
   SbConditionVariableBroadcast(&p->cond);
+  plog("YTV_PLAYER_DESTROY_JOIN_WORKER id=%u\n", p->serial);
   pthread_join(p->worker, nullptr);
+  plog("YTV_PLAYER_DESTROY_WORKER_DONE id=%u\n", p->serial);
   if (p->audio_thread_running) {
+    plog("YTV_PLAYER_DESTROY_JOIN_AUDIO id=%u\n", p->serial);
     pthread_join(p->audio_thread, nullptr);
     p->audio_thread_running = false;
+    plog("YTV_PLAYER_DESTROY_AUDIO_DONE id=%u\n", p->serial);
   }
   for (auto& s : p->video_in) free_sample(p, s.buffer);
   for (auto& s : p->audio_in) free_sample(p, s.buffer);
   destroy_video_decoder(p);
   if (p->aac_ready) sceAudiodecDeleteDecoder(&p->aac);
   if (p->port >= 0) sceAudioOutReleasePort(p->port);
-  // The textures sample the frame pool in place: the pool is unmapped and
-  // freed only after the GPU has finished and the textures are gone.
-  struct Del { GLuint t[3]; SceUID mem; void* pool; bool mapped; };
-  Del* d = new Del{{p->textures[0], p->textures[1], p->textures[2]},
-                   p->frame_mem, p->frame_pool, p->frame_pool_mapped};
-  auto finish = [](void* a) {
-    Del* d = static_cast<Del*>(a);
-    if (d->t[0]) {
-      glFinish();
-      glDeleteTextures(3, d->t);
-    }
-    release_frame_pool(d->mem, d->pool, d->mapped);
-    delete d;
-  };
-  if (!p->textures[0]) {
-    finish(d);
-  } else if (ytv_gl_context_is_current()) {
-    finish(d);
-  } else if (p->provider && p->provider->gles_context_runner) {
-    p->provider->gles_context_runner(p->provider, finish, d);
-  } else {
-    delete d;  // no GL context reachable: leak rather than free memory the GPU may read
-  }
+  // The textures sample the frame pool in place. Cobalt may still hold the
+  // current target (its last video frame); it and the pool are freed only
+  // after the last SbDecodeTargetRelease and the GPU frames that follow.
+  target_unref(p->cur);
+  p->cur = nullptr;
+  pool_unref(p->pool);
+  p->pool = nullptr;
   free(p->es_buffer); free(p->pcm_buffer); free(p->ring);
   SbConditionVariableDestroy(&p->cond);
   SbMutexDestroy(&p->mutex);
+  plog("YTV_PLAYER_DESTROY_DONE id=%u\n", p->serial);
   delete p;
 }
 
@@ -1025,8 +1399,24 @@ void SbPlayerSetBounds(SbPlayer p, int z, int x, int y, int w, int h) {
 
 bool SbPlayerSetPlaybackRate(SbPlayer p, double rate) {
   if (!p) return false;
+  {
+    // DIAGNOSTIC: ux0:data/youtubevita/force_rate.txt ("1.5") replaces normal
+    // speed, to test the time stretcher without YouTube's speed menu.
+    static double forced = -1.0;
+    if (forced < 0.0) {
+      forced = 0.0;
+      FILE* f = fopen("ux0:data/youtubevita/force_rate.txt", "r");
+      if (f) {
+        double v = 0.0;
+        if (fscanf(f, "%lf", &v) == 1 && v >= 0.25 && v <= 2.0) forced = v;
+        fclose(f);
+      }
+    }
+    if (forced > 0.0 && rate == 1.0) rate = forced;
+  }
   plog("YTV_PLAYER_RATE %.2f%s", rate, "\n");
-  if (rate != 0.0 && rate != 1.0) return false;  // only pause/normal speed
+  // 0 = pause; 0.25x .. 2x through the WSOLA stretcher (YouTube's speed menu).
+  if (rate != 0.0 && (rate < 0.25 || rate > 2.0)) return false;
   SbMutexAcquire(&p->mutex);
   if (!p->has_audio && p->clock_running) {
     // Re-base the system clock so pausing does not jump.
@@ -1085,8 +1475,16 @@ bool SbPlayerGetAudioConfiguration(SbPlayer p, int index, SbMediaAudioConfigurat
   return true;
 }
 
-// Decode targets are owned by their player (textures live with it).
-void SbDecodeTargetRelease(SbDecodeTarget target) { (void)target; }
+// Called by Cobalt (GL thread) when an image made from the target is gone.
+void SbDecodeTargetRelease(SbDecodeTarget target) {
+  if (target) target_unref(target);
+}
+
+// GL thread, after every presented frame (port_graphics.cpp).
+void ytv_player_on_swap() {
+  __sync_add_and_fetch(&g_swaps, 1);
+  if (dead_targets_pending()) free_dead_targets(false);
+}
 bool SbDecodeTargetGetInfo(SbDecodeTarget target, SbDecodeTargetInfo* out) {
   if (!target || !out) return false;
   *out = target->info;

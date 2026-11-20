@@ -1,7 +1,7 @@
-param(
+﻿param(
   [string]$Vita3K = "C:\Users\wolff\Documents\Vita3k\Vita3K.exe",
   [string]$TitleId = 'YTVCB0001',
-  [string]$Vpk = 'CobaltNativeBootstrapTest.vpk',
+  [string]$Vpk = 'YouTube.vpk',
   [int]$Seconds = 90,
   [string]$Config = 'vita3k-test.yml',
   [string]$Backend = '',
@@ -16,7 +16,8 @@ param(
 # process started here is ever terminated.
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$VpkPath = Join-Path $Root "build-starboard15\$Vpk"
+$BuildDir = if ($TitleId -eq "YTVCB0002") { "build-youtube-lite" } else { "build-youtube" }
+$VpkPath = Join-Path $Root "$BuildDir\$Vpk"
 $Profile = Join-Path $env:APPDATA 'Vita3K\Vita3K'
 $DataDir = Join-Path $Profile 'ux0\data\youtubevita'
 $AppSelf = Join-Path $Profile "ux0\app\$TitleId\eboot.bin"
@@ -36,9 +37,9 @@ foreach ($f in 'event_cutoff.txt', 'inner_cutoff.txt', 'init_cutoff.txt', 'ctor_
   $p = Join-Path $DataDir $f
   if (Test-Path $p) { [IO.File]::WriteAllText($p, '0') }
 }
-# Sync every packaged file whose size/content changed into the installed
-# title (eboot.bin, fonts, certificates...). sce_sys is left to the installer.
-$Py = "import zipfile,pathlib,zlib;app=pathlib.Path(r'$AppSelf').parent;z=zipfile.ZipFile(r'$VpkPath');n=0`nfor i in z.infolist():`n if i.is_dir() or i.filename.startswith('sce_sys/'):continue`n o=app/i.filename`n if o.exists() and o.stat().st_size==i.file_size and zlib.crc32(o.read_bytes())==i.CRC:continue`n o.parent.mkdir(parents=True,exist_ok=True);o.write_bytes(z.read(i));n+=1`nprint('synced',n,'files')"
+# Sync all packaged files, including sce_sys LiveArea assets.
+# A clean app reinstall may still be required to refresh cached LiveArea metadata.
+$Py = "import zipfile,pathlib,zlib;app=pathlib.Path(r'$AppSelf').parent;z=zipfile.ZipFile(r'$VpkPath');n=0`nfor i in z.infolist():`n if i.is_dir():continue`n o=app/i.filename`n if o.exists() and o.stat().st_size==i.file_size and zlib.crc32(o.read_bytes())==i.CRC:continue`n o.parent.mkdir(parents=True,exist_ok=True);o.write_bytes(z.read(i));n+=1`nprint('synced',n,'files')"
 & python -c $Py
 if ($LASTEXITCODE -ne 0) { throw 'Failed to update eboot.bin' }
 

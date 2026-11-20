@@ -1,0 +1,50 @@
+{
+  "focus.pcm": {
+    "source": "focus_change_small.mp3",
+    "frames": 6587,
+    "duration": 0.1372,
+    "bytes": 26348,
+    "gain": 6.0,
+    "sha256": "ab68177e6a50a91ac813c812c41d22ddeba93edd467968d545aff1c78c54cf30"
+  },
+  "confirm.pcm": {
+    "source": "Tink.mp3",
+    "frames": 1284,
+    "duration": 0.0267,
+    "bytes": 5136,
+    "gain": 0.803,
+    "sha256": "7a8521c55c0ae824364daf5d5daff9180ed97b109204351ecac2138acbc1fa45"
+  },
+  "back.pcm": {
+    "source": "navigation_pop.mp3",
+    "frames": 36000,
+    "duration": 0.75,
+    "bytes": 144000,
+    "gain": 4.346,
+    "sha256": "d2fa30738f78a04ad635df1a9d33821b5141ed8f57a659160fd4c9be01d90561"
+  },
+  "success.pcm": {
+    "source": "3rdParty_Success_Haptic.mp3",
+    "frames": 23125,
+    "duration": 0.4818,
+    "bytes": 92500,
+    "gain": 3.754,
+    "sha256": "877a9665af2264d24223f13ab3cbd4a15bca69539dc2b30f070836e7e208ff60"
+  },
+  "error.pcm": {
+    "source": "3rdParty_Failure_Haptic.mp3",
+    "frames": 23910,
+    "duration": 0.4981,
+    "bytes": 95640,
+    "gain": 3.95,
+    "sha256": "9ec0a178021928733c38ec6af70544ed43ea749617fce56c92efd4589bc94b6a"
+  },
+  "open.pcm": {
+    "source": "navigation_push.mp3",
+    "frames": 36000,
+    "duration": 0.75,
+    "bytes": 144000,
+    "gain": 4.299,
+    "sha256": "f0ed12a8964e12caa94658cfb5d02791e08451b9bdec5d0161810427d80c4391"
+  }
+}

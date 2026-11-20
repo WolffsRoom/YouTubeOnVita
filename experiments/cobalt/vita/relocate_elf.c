@@ -22,10 +22,22 @@
 // Memory budget. Evergreen's libcobalt carries its own musl malloc that
 // grows through SbMemoryMap, so the browser heap is NOT the newlib heap: the
 // newlib heap only serves the platform layer (and SbMemoryAllocate users).
-// 64 MiB newlib + 34 MiB Cobalt image + 48 MiB VitaGL pool; everything else
-// stays free for SbMemoryMap (Cobalt heap, V8) and thread stacks.
+// 112 MiB newlib + 34 MiB Cobalt image + 48 MiB VitaGL pool; everything
+// else stays free for SbMemoryMap (Cobalt heap, V8) and thread stacks.
+// (64 MiB was too small: media buffers come from SbMemoryAllocate, newlib use
+// reached 60.6 MiB during 60 fps playback on hardware and an allocation
+// failure ended in memcpy(NULL) inside libcobalt, while ~143 MiB of user
+// memory was still free.)
 unsigned int sceUserMainThreadStackSize = 4 * 1024 * 1024;
+#if defined(YTV_LOWMEM)
+// Legacy low-memory experimental profile; the v0.58 unified YouTube
+// intentionally no longer defines YTV_LOWMEM and gets 112 MiB newlib.
+ // Other port_* routines use ytv_lowmem_build only for legacy installs.
+int ytv_lowmem_build = 1;
 unsigned int _newlib_heap_size_user = 64 * 1024 * 1024;
+#else
+unsigned int _newlib_heap_size_user = 112 * 1024 * 1024;
+#endif
 
 #define IMAGE_CAPACITY (34u*1024u*1024u)
 #define MAX_HEADERS 32u
@@ -317,6 +329,14 @@ static void ytv_flush_icache(void* start, unsigned size) {
   if (start && size) kuKernelFlushCaches(start, size);
 }
 #define V8_FLUSH_ICACHE_OFFSET 0xd35198u
+// "beq" after "ldr r1,[r6,#20]; cmp r1,#0" in CspDelegateSecure::CanLoad.
+#define COBALT_CSP_REQUIRED_BRANCH 0x18239bcu
+// "beq ok" after "ldr r0,[r5,#12]; cmp r0,#1" in HTMLDecoder (CSP headers).
+#define COBALT_HTML_DECODER_CSP_BRANCH 0x1b9cc00u
+// Embedded user_agent_style_sheet.css registration: size, literal, add-pc.
+#define COBALT_UA_SHEET_MOVW 0x19954f0u
+#define COBALT_UA_SHEET_LITERAL 0x19957ecu
+#define COBALT_UA_SHEET_ADD_PC 0x19954fcu
 
 static int get_init_array(uint32_t *addr,uint32_t *length){
   if(!addr||!length)return 0;
@@ -357,7 +377,34 @@ int main(void) {
   // Main thread affinity: 3 user cores, or 4 with CapUnlocker.
   { extern int ytv_vita_cpu_mask(void); ytv_vita_cpu_mask(); }  // probes CapUnlocker 4th core
 #endif
+#if defined(YTV_COBALT_BOOT_STAGE)
+  // Render the user-requested intro without VitaGL: splash framebuffer and
+  // temporary audio are disposed before loading the 34-MiB Cobalt image.
+  { extern int ytv_native_startup_splash(void);
+    int intro=ytv_native_startup_splash();
+    char intro_msg[200];
+    extern int ytv_native_startup_splash_audio_status(void);
+    extern int ytv_native_startup_splash_audio_started(void);
+    extern int ytv_native_startup_splash_frames_presented(void);
+    extern int ytv_native_startup_splash_frames_dropped(void);
+    extern int ytv_native_startup_splash_vblank_fallbacks(void);
+    snprintf(intro_msg,sizeof(intro_msg),
+       "YTV_NATIVE_SPLASH result=%d audio_status=%d audio_started=%d "
+       "presented=%d skipped=%d vblank_fallbacks=%d",
+       intro,ytv_native_startup_splash_audio_status(),
+       ytv_native_startup_splash_audio_started(),
+       ytv_native_startup_splash_frames_presented(),
+       ytv_native_startup_splash_frames_dropped(),
+       ytv_native_startup_splash_vblank_fallbacks());
+    log_line(intro_msg);
+  }
+#endif
   log_line("\nSTART Evergreen armv7 RAM-only relocation validation");
+#if defined(YTV_LOWMEM)
+  log_line("YTV_MEMORY_PROFILE mode=normal newlib_mb=64\n");
+#else
+  log_line("YTV_MEMORY_PROFILE mode=extended newlib_mb=112 attr2=12\n");
+#endif
   fd=sceIoOpen("app0:libcobalt.so",SCE_O_RDONLY,0);
   check(fd>=0,"official Cobalt ELF data accessible");
   if(fd<0)goto done;
@@ -599,6 +646,62 @@ int main(void) {
         f[1]=(uint32_t)(uintptr_t)&ytv_flush_icache;
         note_u32("V8_FLUSH_ICACHE_SHIM",V8_FLUSH_ICACHE_OFFSET,f[1]);
       }
+      {
+        // Browser builds: production Cobalt forces csp::kCSPRequired, so on a
+        // page served without a Content-Security-Policy header
+        // CspDelegateSecure::CanLoad refuses every subresource (CSS, scripts,
+        // images) and the page stays black. Removing the "policy == required"
+        // branch gives the debug-build behaviour (kCSPOptional). Applied only
+        // when the original instructions match (Cobalt 25.lts.50.1035044).
+        int want_relax=0;
+#if defined(YTV_BROWSER_BUILD)
+        want_relax=1;
+#else
+        { SceIoStat st; want_relax=sceIoGetstat("ux0:data/youtubevita/csp_optional.txt",&st)>=0; }
+#endif
+        if(want_relax){
+          uint32_t* c=(uint32_t*)(image+COBALT_CSP_REQUIRED_BRANCH);
+          int matches=c[-2]==0xe5961014u && c[-1]==0xe3510000u && c[0]==0x0a000012u;
+          note_u32("COBALT_CSP_OPTIONAL",COBALT_CSP_REQUIRED_BRANCH,(unsigned)matches);
+          if(matches)c[0]=0xe320f000u;  // nop
+          // dom_parser/html_decoder.cc: "Failure receiving Content Security
+          // Policy headers" unless policy == kCSPOptional -> always accept.
+          uint32_t* h=(uint32_t*)(image+COBALT_HTML_DECODER_CSP_BRANCH);
+          int h_ok=h[-2]==0xe595000cu && h[-1]==0xe3500001u && h[0]==0x0a000030u;
+          note_u32("COBALT_HTML_CSP_OPTIONAL",COBALT_HTML_DECODER_CSP_BRANCH,(unsigned)h_ok);
+          if(h_ok)h[0]=0xea000030u;  // beq -> b
+        }
+        // Browser builds: replace Cobalt's TV user-agent style sheet (an
+        // embedded resource: PC-relative pointer + "movw r3,#773" size) with
+        // ours, so pages get a white background, margins, headings, links.
+        const char* ua_path=NULL;
+#if defined(YTV_BROWSER_BUILD)
+        ua_path="app0:browser/ua.css";
+#else
+        ua_path="ux0:data/youtubevita/ua.css";  // diagnostic
+#endif
+        SceUID ua_fd=sceIoOpen(ua_path,SCE_O_RDONLY,0);
+        if(ua_fd>=0){
+          static char* ua_css=NULL;
+          SceOff ua_len=sceIoLseek(ua_fd,0,SCE_SEEK_END);
+          sceIoLseek(ua_fd,0,SCE_SEEK_SET);
+          uint32_t* mv=(uint32_t*)(image+COBALT_UA_SHEET_MOVW);
+          uint32_t* lit=(uint32_t*)(image+COBALT_UA_SHEET_LITERAL);
+          uint32_t add_pc=(uint32_t)(uintptr_t)(image+COBALT_UA_SHEET_ADD_PC);
+          int ok=mv[0]==0xe3003305u && lit[0]==0xfee564b1u && ua_len>0 && ua_len<0xffff;
+          if(ok) ua_css=(char*)malloc((size_t)ua_len+1);
+          if(ok && ua_css && sceIoRead(ua_fd,ua_css,(SceSize)ua_len)==(int)ua_len){
+            ua_css[ua_len]=0;
+            uint32_t n=(uint32_t)ua_len;
+            mv[0]=0xe3003000u|((n>>12)<<16)|(n&0xfffu);  // movw r3,#n
+            lit[0]=(uint32_t)(uintptr_t)ua_css-(add_pc+8u);
+            note_u32("COBALT_UA_SHEET",n,1);
+          }else{
+            note_u32("COBALT_UA_SHEET",(unsigned)ua_len,0);
+          }
+          sceIoClose(ua_fd);
+        }
+      }
       uint8_t first_text_bytes[16];
       memcpy(first_text_bytes,image+xstart,16);
       int protection=kuKernelMemProtect(image+xstart,xlen,
@@ -741,6 +844,16 @@ int main(void) {
         int n=ytv_starboard_pump_scheduled(0);
         if(n>0)dispatched+=(unsigned)n;
         ytv_vita_input_pump();
+        {
+          extern int ytv_vita_network_poll(void);
+          static SceUInt64 next_net=0;
+          SceUInt64 tnow=sceKernelGetSystemTimeWide();
+          if(tnow>=next_net){next_net=tnow+1000000ull;ytv_vita_network_poll();}
+          extern void ytv_addons_tick(void);
+          ytv_addons_tick();
+          extern void ytv_osk_tick(void);
+          ytv_osk_tick();
+        }
         int code=0;
         if(ytv_vita_lifecycle_should_exit(&code)){
           note_u32("COBALT_LIFECYCLE_EXIT",(unsigned)code,dispatched);

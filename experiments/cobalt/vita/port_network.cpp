@@ -15,6 +15,7 @@
 #include <malloc.h>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <climits>
 
 struct SbSocketPrivate {
@@ -341,10 +342,41 @@ bool SbSocketGetInterfaceAddress(const SbSocketAddress* destination,
   if(netmask)*netmask=mask;
   return true;
 }
+// Conservative host-only filter. Does NOT block in-player ads sent from
+// first-party youtube.com/googlevideo.com endpoints. Never block those hosts.
+extern "C" int g_ytv_adblock_enabled;
+static bool ytv_known_ad_host(const char* name) {
+  if (!name) return false;
+  const char* hosts[] = {
+      "googleads.g.doubleclick.net",
+      "pagead2.googlesyndication.com",
+      "www.googleadservices.com",
+      "adservice.google.com",
+      "adservice.google.com.br",
+      "static.doubleclick.net",
+      "pubads.g.doubleclick.net",
+  };
+  for (const char* h : hosts) {
+    if (!strcasecmp(name, h)) return true;
+  }
+  return false;
+}
+
 static SbSocketResolution* resolve_impl(const char* hostname,int filters) {
   if(!hostname || !*hostname || strlen(hostname)>253 ||
      ((filters&kSbSocketResolveFilterIpv6) &&
-      !(filters&kSbSocketResolveFilterIpv4)) || !ensure_net())return nullptr;
+      !(filters&kSbSocketResolveFilterIpv4)))return nullptr;
+  if(__atomic_load_n(&g_ytv_adblock_enabled, __ATOMIC_RELAXED) &&
+     ytv_known_ad_host(hostname)) {
+    static volatile int count = 0;
+    if (__sync_fetch_and_add(&count, 1) < 32) {
+      char line[200];
+      snprintf(line, sizeof(line), "YTV_ADBLOCK blocked_host=%s\n", hostname);
+      SbLogRaw(line);
+    }
+    return nullptr;
+  }
+  if(!ensure_net())return nullptr;
   SceNetInAddr address={};
   if(sceNetInetPton(SCE_NET_AF_INET,hostname,&address.s_addr)!=1) {
     SceNetResolverParam options={};

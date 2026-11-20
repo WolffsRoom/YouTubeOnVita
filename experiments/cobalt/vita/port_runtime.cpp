@@ -35,15 +35,32 @@ int ytv_runtime_once_count() {
 void ytv_runtime_once_trace_enable() {
   __sync_lock_test_and_set(&g_ytv_once_trace,1);
 }
+// Allocation failures are logged (always, first few): a NULL here usually
+// ends in a crash inside Cobalt a moment later.
+static void report_alloc_failure(const char* what,size_t size){
+  static volatile int reported=0;
+  if(__sync_fetch_and_add(&reported,1)>=8)return;
+  char line[120];
+  struct mallinfo mi=mallinfo();
+  snprintf(line,sizeof(line),"YTV_LIFECYCLE_ALLOC_FAIL %s size=%u newlib_used=%d\n",
+           what,(unsigned)size,(int)mi.uordblks);
+  SbLogRaw(line);
+}
 void* SbMemoryAllocate(size_t size) {
-  return SbMemoryAllocateUnchecked(size);
+  void* p=SbMemoryAllocateUnchecked(size);
+  if(!p && size)report_alloc_failure("allocate",size);
+  return p;
 }
 void* SbMemoryReallocate(void* pointer,size_t size) {
-  return SbMemoryReallocateUnchecked(pointer,size);
+  void* p=SbMemoryReallocateUnchecked(pointer,size);
+  if(!p && size)report_alloc_failure("reallocate",size);
+  return p;
 }
 void* SbMemoryAllocateAligned(size_t alignment,size_t size) {
   if(alignment<sizeof(void*) || (alignment&(alignment-1))!=0)return nullptr;
-  return SbMemoryAllocateAlignedUnchecked(alignment,size);
+  void* p=SbMemoryAllocateAlignedUnchecked(alignment,size);
+  if(!p && size)report_alloc_failure("allocate_aligned",size);
+  return p;
 }
 void SbMemoryDeallocate(void* pointer) { SbMemoryFree(pointer); }
 void SbMemoryDeallocateAligned(void* pointer) { SbMemoryFreeAligned(pointer); }

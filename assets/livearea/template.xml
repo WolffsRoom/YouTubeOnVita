@@ -1,14 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Standard third-party LiveArea (style "a1"). "content_manager" is not a
-     LiveArea style, so the system ignored the previous template and showed the
-     default background/gate. The background image already carries the title.
-     content-rev is bumped so an installed copy refreshes its LiveArea. -->
-<livearea style="a1" format-ver="01.00" content-rev="3">
-	<livearea-background>
-		<image>bg0.png</image>
-	</livearea-background>
-
-	<gate>
-		<startup-image>startup.png</startup-image>
-	</gate>
+<livearea style="a5" format-ver="01.00" content-rev="7">
+  <livearea-background>
+    <image>bg0.png</image>
+  </livearea-background>
+  <gate>
+    <startup-image>startup.png</startup-image>
+  </gate>
 </livearea>

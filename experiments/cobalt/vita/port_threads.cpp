@@ -41,6 +41,37 @@ int vita_priority(SbThreadPriority p){
     default: return 160;
   }
 }
+// UI thread policy. The page's JS/style/layout thread (MainWebModule)
+// produces every UI frame. With cobalt_config "affinity" on (default) it gets
+// core 0 to itself and every other Cobalt thread runs on the remaining cores,
+// so background work (V8 compilers, image decode, network, media) never shares
+// its core. Priorities: MainWebModule/ScrollEngineThread 128 (above the 160 of
+// background threads). The process main thread and audio threads keep all
+// cores. "affinity=0" restores all cores for everyone (for comparison).
+extern "C" int ytv_cfg_affinity();
+extern "C" int ytv_vita_cpu_mask();
+int ytv_thread_default_mask(){
+  int all=ytv_vita_cpu_mask();
+  if(!ytv_cfg_affinity())return all;
+  int rest=all&~SCE_KERNEL_CPU_MASK_USER_0;
+  return rest?rest:all;
+}
+void apply_ui_thread_policy(const char* name){
+  // SplashScreenWebModule runs the YouTube intro animation while the main
+  // module loads; on hardware it presented 1 frame (v0.33 log), so it gets UI
+  // priority too.
+  bool ui=!strcmp(name,"MainWebModule")||!strcmp(name,"ScrollEngineThread")||
+          !strcmp(name,"SplashScreenWebModule");
+  if(ui)sceKernelChangeThreadPriority(0,128);
+  if(!ytv_cfg_affinity())return;
+  if(!strcmp(name,"MainWebModule")){
+    int r=sceKernelChangeThreadCpuAffinityMask(0,SCE_KERNEL_CPU_MASK_USER_0);
+    char line[96];
+    snprintf(line,sizeof(line),"YTV_LIFECYCLE_AFFINITY MainWebModule core0 others=0x%x r=0x%x\n",
+             (unsigned)ytv_thread_default_mask(),(unsigned)r);
+    SbLogRaw(line);
+  }
+}
 pthread_once_t name_once=PTHREAD_ONCE_INIT;
 pthread_key_t name_key={};
 bool name_ready=false;
@@ -67,11 +98,11 @@ void* run_thread(void *arg) {
   snprintf(line,sizeof(line),"YTV_THREAD_ENTRY tid=%d name=%s entry=%p\n",
            sceKernelGetThreadId(),state.name,(void*)state.function);
   SbLogRaw(line);
-  if(state.name[0])SbThreadSetName(state.name);
-  // pthread_create ignores Starboard priority; apply it, and allow all three
-  // user cores (the browser runs JS, layout and raster threads in parallel).
+  // pthread_create ignores Starboard priority; apply it and the core mask
+  // first, then the name (naming applies the per-thread UI policy below).
   sceKernelChangeThreadPriority(0,vita_priority(state.priority));
-  sceKernelChangeThreadCpuAffinityMask(0,ytv_vita_cpu_mask());
+  sceKernelChangeThreadCpuAffinityMask(0,ytv_thread_default_mask());
+  if(state.name[0])SbThreadSetName(state.name);
   void* result=state.function(state.context);
   snprintf(line,sizeof(line),"YTV_THREAD_EXIT tid=%d name=%s result=%p\n",
            sceKernelGetThreadId(),state.name,result);
@@ -181,7 +212,11 @@ bool SbThreadJoin(SbThread thread,void** out_return){
 void SbThreadDetach(SbThread thread){
   if(thread)pthread_detach((pthread_t)thread);
 }
-void SbThreadYield() { sched_yield(); }
+// A real yield: sched_yield only lets threads of equal or higher priority on
+// the same core run, so a spin-then-yield loop in a high-priority thread
+// (MainWebModule is 128) could starve the lower-priority thread it waits on.
+// A short sleep lets every thread run.
+void SbThreadYield() { sceKernelDelayThread(100); }
 void SbThreadSleep(int64_t duration) {
   while(duration>0){
     unsigned step=(unsigned)(duration>1000000LL?1000000LL:duration);
@@ -218,10 +253,7 @@ void SbThreadSetName(const char *name) {
     int total=g_slot_count<96?g_slot_count:96;
     for(int i=0;i<total;i++)
       if(g_slots[i].uid==me)snprintf(g_slots[i].name,sizeof(g_slots[i].name),"%s",name);
-    // The page's JS/style/layout thread produces every UI frame; it must not
-    // queue behind network, storage, media or V8 worker threads (all 160).
-    if(!strcmp(name,"MainWebModule")||!strcmp(name,"ScrollEngineThread"))
-      sceKernelChangeThreadPriority(0,128);
+    apply_ui_thread_policy(name);
     SceKernelThreadInfo info; memset(&info,0,sizeof(info)); info.size=sizeof(info);
     sceKernelGetThreadInfo(me,&info);
     char line[120];

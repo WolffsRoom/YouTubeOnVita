@@ -36,7 +36,7 @@ struct SbAudioSinkPrivate {
   SbAudioSinkUpdateSourceStatusFunc status;
   SbAudioSinkConsumeFramesFunc consume;
   void* context;
-  SceUID thread;
+  pthread_t thread;  // pthread: Cobalt callbacks run here and take SbMutex
   volatile int stopping;
   uint32_t magic;
 };
@@ -137,6 +137,15 @@ int audio_thread(SceSize, void* argp) {
   sceAudioOutOutput(s->port, nullptr);  // drain
   return 0;
 }
+// The sink callbacks are Cobalt code that locks SbMutex/condition variables,
+// which park on a per-thread semaphore found through pthread TLS: run them on
+// a pthread (raw kernel threads crash inside pthread-embedded on hardware).
+void* audio_pthread(void* arg) {
+  sceKernelChangeThreadPriority(0, kAudioThreadPriority);
+  SbAudioSink s = static_cast<SbAudioSink>(arg);
+  audio_thread(sizeof(s), &s);
+  return nullptr;
+}
 
 bool register_sink(SbAudioSink s) {
   for (auto& slot : g_sinks)
@@ -219,11 +228,12 @@ SbAudioSink SbAudioSinkCreate(int channels, int hz, SbMediaAudioSampleType type,
   if (!registered) {
     free(sink); sceAudioOutReleasePort(port); return kSbAudioSinkInvalid;
   }
-  sink->thread = sceKernelCreateThread("ytv_audio", audio_thread,
-                                       kAudioThreadPriority, 0x10000, 0, 0, nullptr);
-  if (sink->thread < 0 ||
-      sceKernelStartThread(sink->thread, sizeof(sink), &sink) < 0) {
-    if (sink->thread >= 0) sceKernelDeleteThread(sink->thread);
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 0x10000);
+  int created = pthread_create(&sink->thread, &attr, audio_pthread, sink);
+  pthread_attr_destroy(&attr);
+  if (created != 0) {
     pthread_mutex_lock(&g_lock); unregister_sink(sink); pthread_mutex_unlock(&g_lock);
     free(sink); sceAudioOutReleasePort(port); return kSbAudioSinkInvalid;
   }
@@ -232,8 +242,7 @@ SbAudioSink SbAudioSinkCreate(int channels, int hz, SbMediaAudioSampleType type,
 void SbAudioSinkDestroy(SbAudioSink sink) {
   if (!SbAudioSinkIsValid(sink)) return;
   sink->stopping = 1;
-  sceKernelWaitThreadEnd(sink->thread, nullptr, nullptr);  // no callbacks after return
-  sceKernelDeleteThread(sink->thread);
+  pthread_join(sink->thread, nullptr);  // no callbacks after return
   sceAudioOutReleasePort(sink->port);
   pthread_mutex_lock(&g_lock);
   unregister_sink(sink);

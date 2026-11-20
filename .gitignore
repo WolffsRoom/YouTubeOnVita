@@ -34,3 +34,13 @@ tools/opengl_capture/*.obj
 tools/opengl_capture/*.exp
 tools/opengl_capture/*.lib
 __pycache__/
+
+# Cobalt storage records (session cookies), even if copied into the tree
+*.dat
+storage/
+# Generated CMake build directories
+build-*/
+# Crash dumps from Vita3K
+note_*.bin
+# Generated packaging sidecars
+*.vpk.out

@@ -181,12 +181,20 @@ int SbSystemGetErrorString(SbSystemError error,char* out,int size){
 // hard-coded values, notably CobaltEnableJit()==false (V8 --jitless), which
 // made all of YouTube's JavaScript run interpreted. Values are Cobalt's
 // defaults except where noted for the Vita.
+// Low-memory build ("YouTube Lite"): weak, so absent (0) everywhere else.
+// File scope on purpose: inside the anonymous namespace the weak symbol
+// got internal (mangled) linkage and never resolved (v0.45 Lite).
+extern "C" int ytv_lowmem_build __attribute__((weak));
+extern "C" bool ytv_lowmem(){return &ytv_lowmem_build && ytv_lowmem_build;}
+
 namespace {
 // Optional overrides for performance experiments, read once from
 // ux0:data/youtubevita/cobalt_config.txt: "rasterizer=hardware",
 // "jit=0", "swap_interval=0".
-struct Overrides { char rasterizer[24]; int jit; int swap_interval; bool loaded; };
-Overrides g_ovr = {"direct-gles", 1, 1, false};
+struct Overrides { char rasterizer[24]; int jit; int swap_interval; int affinity; bool loaded; };
+// affinity defaults to 0 since v0.37: with MainWebModule alone on core 0 a
+// busy wait there froze the UI on hardware (v0.36 "frezee" log).
+Overrides g_ovr = {"direct-gles", 1, 1, 0, false};
 void load_overrides(){
   if(g_ovr.loaded)return;
   g_ovr.loaded=true;
@@ -204,31 +212,45 @@ void load_overrides(){
       if(!strcmp(key,"rasterizer"))snprintf(g_ovr.rasterizer,sizeof(g_ovr.rasterizer),"%s",val);
       else if(!strcmp(key,"jit"))g_ovr.jit=atoi(val);
       else if(!strcmp(key,"swap_interval"))g_ovr.swap_interval=atoi(val);
+      else if(!strcmp(key,"affinity"))g_ovr.affinity=atoi(val);
     }
     line=next;
   }
   char msg[128];
-  snprintf(msg,sizeof(msg),"YTV_CONFIG rasterizer=%s jit=%d swap_interval=%d\n",
-           g_ovr.rasterizer,g_ovr.jit,g_ovr.swap_interval);
+  snprintf(msg,sizeof(msg),"YTV_LIFECYCLE_CONFIG rasterizer=%s jit=%d swap_interval=%d affinity=%d\n",
+           g_ovr.rasterizer,g_ovr.jit,g_ovr.swap_interval,g_ovr.affinity);
   SbLogRaw(msg);
 }
+}  // namespace
+extern "C" int ytv_cfg_affinity(){load_overrides();return g_ovr.affinity;}
+namespace {
 const char* cfg_exit_strategy(){return "stop";}
 bool cfg_dirty_region_only(){return false;}  // GXM buffers rotate, no preserve
 int cfg_swap_interval(){load_overrides();return g_ovr.swap_interval;}
+// YouTube's own animated splash from the official Cobalt package
+// (app0:web/cobalt/browser/splash_screen/). Was black_splash_screen.html: a
+// static black page, i.e. the grey -> black -> UI start-up the user saw when
+// no cached splash existed.
+// Tried (v0.43): file:///cobalt/browser/splash_screen/youtube_splash_screen.html
+// from the official package. It crashed Vita3K at every start (render-target
+// creation failed in its GL renderer); kept black until tested on hardware.
 const char* cfg_fallback_splash(){return "h5vcc-embedded://black_splash_screen.html";}
 bool cfg_enable_quic(){return true;}
-int cfg_skia_cache(){return 8*1024*1024;}          // default 4 MiB
+int cfg_skia_cache(){return 4*1024*1024;}  // default 4 MiB
 int cfg_offscreen_cache(){return -1;}
 int cfg_encoded_image_cache(){return 4*1024*1024;} // default 1 MiB
-int cfg_image_cache(){return 32*1024*1024;}        // thumbnails (default auto)
-int cfg_local_typeface_cache(){return 16*1024*1024;}
+// Thumbnails. 32 MiB let VitaGL's VRAM run down to ~16 MiB free in a 9 min
+// session (v0.42 hardware log); with its RAM pool nearly full that ends in
+// failed allocations (artifacts).
+int cfg_image_cache(){return 14*1024*1024;}
+int cfg_local_typeface_cache(){return 8*1024*1024;}
 int cfg_remote_typeface_cache(){return 8*1024*1024;} // default 4 MiB
 int cfg_mesh_cache(){return 1024*1024;}
-int cfg_software_surface_cache(){return 8*1024*1024;}
+int cfg_software_surface_cache(){return 4*1024*1024;}
 float cfg_image_cache_video_multiplier(){return 1.0f;}
 int cfg_glyph_atlas_w(){return -1;}
 int cfg_glyph_atlas_h(){return -1;}
-int cfg_js_gc_threshold(){return 16*1024*1024;}    // default 8 MiB
+int cfg_js_gc_threshold(){return (ytv_lowmem()?8:16)*1024*1024;}  // default 8 MiB
 int cfg_reduce_cpu(){return -1;}
 int cfg_reduce_gpu(){return -1;}
 bool cfg_gc_zeal(){return false;}
@@ -276,8 +298,33 @@ const ConfigurationApi kConfigurationApi = {
   cfg_rasterizer, cfg_enable_jit, cfg_splash_topics, cfg_store_compiled_js,
 };
 }  // namespace
+extern const void* ytv_media_session_extension();
+// dev.cobalt.extension.Graphics v1. Cobalt asks for the maximum frame
+// interval on every rasterizer tick. Normally -1 (draw only when something
+// changed, as before). While the Vita IME dialog is open it must be drawn and
+// updated on every swap, so a frame is forced at least every 33 ms: an idle
+// page made no swaps and the keyboard froze (v0.48 Lite, Add-ons > IME).
+extern "C" bool ytv_osk_active();
+extern "C" bool ytv_addons_wants_frames();  // port_addons.cpp: menu/toast visible
+struct YtvGraphicsApi { const char* name; uint32_t version; float (*max_interval)(); };
+extern "C" volatile int g_ytv_graphics_ext_active = 0;
+float ytv_max_frame_interval(){return ytv_osk_active()||ytv_addons_wants_frames()?33.f:-1.f;}
+const YtvGraphicsApi kGraphicsApi={"dev.cobalt.extension.Graphics",1,ytv_max_frame_interval};
 const void* SbSystemGetExtension(const char* name){
+  if(name && strcmp(name,kGraphicsApi.name)==0){
+    g_ytv_graphics_ext_active=1;
+    SbLogRaw("YTV_LIFECYCLE_GRAPHICS_EXTENSION requested\n");
+    return &kGraphicsApi;
+  }
   if(name && strcmp(name,kConfigurationApi.name)==0)return &kConfigurationApi;
+  // Exact active media artwork ID bridge; harmless when Cobalt does not use it.
+  if(name && strcmp(name,"dev.cobalt.extension.MediaSession")==0){
+    SbLogRaw("YTV_MEDIA_SESSION_EXTENSION_REQUESTED\n");
+    return ytv_media_session_extension();
+  }
+  // Vita IME for text fields (port_osk.cpp); null when turned off.
+  extern const void* ytv_osk_extension();
+  if(name && strcmp(name,"dev.cobalt.extension.OnScreenKeyboard")==0)return ytv_osk_extension();
   return nullptr;
 }
 bool SbSystemSupportsResume(){return false;}

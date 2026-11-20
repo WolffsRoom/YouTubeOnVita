@@ -94,9 +94,19 @@ volatile uint64_t g_prof_frame_first = 0;  // first draw of the current frame
 // Heartbeat counters (always collected; summarised every heartbeat).
 volatile uint32_t g_hb_frames = 0, g_hb_draws = 0, g_hb_compiles = 0, g_hb_links = 0;
 volatile uint64_t g_hb_swap_us = 0, g_hb_raster_us = 0, g_hb_compile_us = 0, g_hb_link_us = 0;
+// Frame pacing: intervals between presented frames while animating (gaps over
+// 250 ms are idle screen time, not jank).
+volatile uint64_t g_hb_prev_swap = 0, g_hb_max_interval_us = 0;
+volatile uint32_t g_hb_jank20 = 0, g_hb_jank40 = 0;
 volatile uint64_t g_prof_raster_us = 0;    // first draw -> swap, summed
 volatile uint64_t g_prof_idle_us = 0;      // previous swap end -> first draw
 volatile uint64_t g_prof_last_swap_end = 0;
+// Startup-only transition: replace Cobalt's empty/black bootstrap frames with
+// #212121. Stop permanently as soon as Cobalt paints a real page; never touch
+// video frames, the player's YUV planes, or normal UI frames.
+uint32_t g_startup_draws = 0;
+bool g_startup_bg_active = true;
+
 
 
 // ---- VitaGL / GXM bring-up ------------------------------------------------
@@ -145,6 +155,11 @@ void seed_shader_cache() {
   log_line(line);
 }
 
+}  // namespace
+extern "C" int ytv_addons_cfg_fhd();  // port_addons.cpp (Full HD option)
+extern "C" bool ytv_lowmem();         // port_system.cpp (YouTube Lite)
+extern "C" { extern volatile size_t g_vgl_free_vram, g_vgl_free_ram, g_vgl_free_phy; }
+namespace {
 bool ensure_vitagl() {
   pthread_mutex_lock(&g_init_mutex);
   if (!g_vgl_ready) {
@@ -159,13 +174,25 @@ bool ensure_vitagl() {
     SceKernelFreeMemorySizeInfo info = {};
     info.size = sizeof(info);
     sceKernelGetFreeMemorySize(&info);
-    const int kRamPool = 48 * 1024 * 1024;
+    // YouTube Lite: 24 MiB. 20 MiB (v0.46-v0.48) left only ~1.3 MiB of the
+    // pool free for a whole hardware session.
+    const int kRamPool = (ytv_lowmem() ? 24 : 48) * 1024 * 1024;
     int user_free = info.size_user;
     int ram_threshold = user_free > kRamPool ? user_free - kRamPool : 0;
-    // Keep 16 MiB of physically contiguous RAM for the H.264 decoder
-    // (reference frames + decoded picture pool); VitaGL takes the rest.
+    // Keep 16 MiB of physically contiguous RAM and 20 MiB of CDRAM for the
+    // H.264 decoder (reference frames + decoded picture pool). On hardware
+    // only ~10 MiB of phycont was actually free and VitaGL took all CDRAM,
+    // so every 480p/720p player failed and YouTube fell back to 360p (and
+    // the sign-in animation video never played). VitaGL takes the rest.
+    // Full HD (Add-ons): the 1920x1088 decoder needs ~2x the video memory.
+    const int cdram_reserve = (ytv_addons_cfg_fhd() && !ytv_lowmem() ? 40 : 20) * 1024 * 1024;
+    // VitaGL's per-frame circular vertex pool defaults to 32 MiB taken from
+    // its RAM pool, which left that pool ~6.5 MiB free for textures (v0.42
+    // log). 12 MiB (4 MiB per frame) is ample for Cobalt; overflows fall back
+    // to a normal allocation.
+    vglSetCircularPoolSize((ytv_lowmem() ? 8 : 12) * 1024 * 1024);
     g_vgl_fallback = vglInitWithCustomThreshold(
-        0x80000, 960, 544, ram_threshold, 0, 16 * 1024 * 1024,
+        0x80000, 960, 544, ram_threshold, cdram_reserve, 16 * 1024 * 1024,
         0x7fffffff /* no common-dialog pool, same as vglInitExtended */,
         SCE_GXM_MULTISAMPLE_NONE);
     g_vgl_ready = true;
@@ -179,6 +206,15 @@ bool ensure_vitagl() {
              (int)g_vgl_fallback, info.size_user, after.size_user,
              info.size_cdram, after.size_cdram);
     log_line(line);
+    // Until Cobalt presents its first frame (the YouTube splash), show the
+    // splash's own grey (#212121, same tone as the LiveArea startup image)
+    // instead of black display buffers.
+    ::glClearColor(0x21 / 255.f, 0x21 / 255.f, 0x21 / 255.f, 1.f);
+    for (int i = 0; i < 2; i++) {
+      ::glClear(GL_COLOR_BUFFER_BIT);
+      vglSwapBuffers(GL_FALSE);
+    }
+    ::glClearColor(0.f, 0.f, 0.f, 0.f);
   }
   pthread_mutex_unlock(&g_init_mutex);
   return true;
@@ -566,6 +602,14 @@ void dump_frame(int n) {
   free(rgba);
 }
 #endif
+extern "C" void ytv_addons_before_swap();
+// VitaGL's own pools (sampled on the GL thread once a second; vglMemFree walks
+// VitaGL's heap and must not race with it). When these run dry VitaGL draws
+// with missing vertex data / textures: stretched triangles, missing images.
+// (VitaGL pool counters: declared at file scope above.)
+extern "C" void ytv_player_on_swap();
+extern "C" void ytv_native_startup_splash_release(void);
+extern "C" bool ytv_osk_active();
 EGLBoolean ytv_egl_swap_buffers(EGLDisplay display, EGLSurface surface) {
   if (!is_valid_display(display)) return fail(EGL_BAD_DISPLAY);
   if (pbuffer_index(surface) >= 0) { ok(); return EGL_TRUE; }  // no-op per spec
@@ -578,10 +622,62 @@ EGLBoolean ytv_egl_swap_buffers(EGLDisplay display, EGLSurface surface) {
     g_hb_raster_us += swap_t0 - g_prof_frame_first;
   }
   g_prof_frame_first = 0;
-  ::eglSwapBuffers(display, surface);
+  {
+    static uint64_t last_mem = 0;
+    uint64_t t = sceKernelGetSystemTimeWide();
+    if (t - last_mem > 1000000ull) {
+      last_mem = t;
+      g_vgl_free_vram = vglMemFree(VGL_MEM_VRAM);
+      g_vgl_free_ram = vglMemFree(VGL_MEM_RAM);
+      g_vgl_free_phy = vglMemFree(VGL_MEM_SLOW);
+    }
+  }
+  if (g_startup_bg_active) {
+    // A clearing-only/empty frame is not the YouTube UI. During the handoff
+    // from our Lottie scanout to Cobalt, cover only these bootstrap frames.
+    // Pure GL clear, no YUV manipulation/readback or per-pixel CPU work.
+    const uint32_t draws = g_startup_draws;
+    g_startup_draws = 0;
+    if (draws <= 2u) {
+      GLfloat old_clear[4] = {0.f, 0.f, 0.f, 0.f};
+      ::glGetFloatv(GL_COLOR_CLEAR_VALUE, old_clear);
+      GLboolean old_mask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
+      ::glGetBooleanv(GL_COLOR_WRITEMASK, old_mask);
+      const GLboolean scissor = ::glIsEnabled(GL_SCISSOR_TEST);
+      if (scissor) ::glDisable(GL_SCISSOR_TEST);
+      ::glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+      ::glClearColor(33.f / 255.f, 33.f / 255.f, 33.f / 255.f, 1.f);
+      ::glClear(GL_COLOR_BUFFER_BIT);
+      ::glClearColor(old_clear[0], old_clear[1], old_clear[2], old_clear[3]);
+      ::glColorMask(old_mask[0], old_mask[1], old_mask[2], old_mask[3]);
+      if (scissor) ::glEnable(GL_SCISSOR_TEST);
+      static int filled = 0;
+      if (filled++ == 0) log_line("YTV_BOOT_BG #212121 (Cobalt bootstrap only)\n");
+    } else {
+      g_startup_bg_active = false;
+      char msg[96];
+      snprintf(msg, sizeof(msg), "YTV_BOOT_BG complete: first UI frame draws=%u\n", draws);
+      log_line(msg);
+    }
+  }
+  ytv_addons_before_swap();  // native add-on menu / toast overlay
+  // While the Vita IME dialog is open VitaGL must draw the system dialog too.
+  if (ytv_osk_active()) vglSwapBuffers(GL_TRUE);
+  else ::eglSwapBuffers(display, surface);
+  ytv_native_startup_splash_release();  // release intro fb AFTER VitaGL swap
+  ytv_player_on_swap();  // frees video decode targets the GPU is done with
   g_prof_last_swap_end = sceKernelGetSystemTimeWide();
   g_hb_swap_us += g_prof_last_swap_end - swap_t0;
   g_hb_frames++;
+  if (g_hb_prev_swap) {
+    uint64_t interval = swap_t0 - g_hb_prev_swap;
+    if (interval < 250000) {
+      if (interval > g_hb_max_interval_us) g_hb_max_interval_us = interval;
+      if (interval > 20000) g_hb_jank20++;
+      if (interval > 40000) g_hb_jank40++;
+    }
+  }
+  g_hb_prev_swap = swap_t0;
   {
     // Per-second frame profile (verbose log only): frames presented, time
     // spent inside eglSwapBuffers, in draw calls, in texture uploads, and the
@@ -722,6 +818,14 @@ void ytv_gl_bind_renderbuffer(GLenum target, GLuint rbo) {
 }
 void ytv_gl_renderbuffer_storage(GLenum target, GLenum format, GLsizei w,
                                  GLsizei h) {
+  {
+    static int n = 0;
+    if (n++ < 30) {
+      char line[112];
+      snprintf(line, sizeof(line), "YTV_LIFECYCLE_GL_RBO %dx%d fmt=0x%x\n", (int)w, (int)h, (unsigned)format);
+      log_line(line);
+    }
+  }
   ::glRenderbufferStorage(target, format, w, h);
   pthread_mutex_lock(&g_gl_mutex);
   if (g_bound_rbo) {
@@ -924,6 +1028,22 @@ void ytv_gl_shader_source(GLuint shader, GLsizei count,
   }
   merged[w] = 0;
   if (removed) __sync_add_and_fetch(&g_pragmas_removed, removed);
+  // DIAGNOSTIC: ux0:data/youtubevita/dump_shaders.txt writes every distinct
+  // shader source to ux0:data/youtubevita/shaders/<n>.glsl.
+  {
+    static int enabled = -1, n = 0;
+    if (enabled < 0) {
+      SceIoStat st;
+      enabled = sceIoGetstat("ux0:data/youtubevita/dump_shaders.txt", &st) >= 0;
+      if (enabled) sceIoMkdir("ux0:data/youtubevita/shaders", 0777);
+    }
+    if (enabled && n < 400) {
+      char path[96];
+      snprintf(path, sizeof(path), "ux0:data/youtubevita/shaders/%03d.glsl", n++);
+      SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+      if (fd >= 0) { sceIoWrite(fd, merged, (SceSize)w); sceIoClose(fd); }
+    }
+  }
   const GLchar* one = merged;
   GLint len = (GLint)w;
   ::glShaderSource(shader, 1, &one, &len);
@@ -1026,9 +1146,38 @@ GLboolean ytv_gl_is_enabled(GLenum cap) {
   if (cap == GL_DITHER) return g_dither_enabled;
   return ::glIsEnabled(cap);
 }
+// DIAGNOSTIC (verbose log): internal format of each texture, to report the
+// formats Cobalt/Skia attach as render targets.
+static uint16_t g_diag_tex_fmt[4096];
 void ytv_gl_tex_image_2d(GLenum target, GLint level, GLint ifmt, GLsizei w,
                          GLsizei h, GLint border, GLenum format, GLenum type,
                          const void* pixels) {
+  if (level == 0) {
+    GLint bound = 0;
+    ::glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+    if (bound > 0 && bound < 4096) g_diag_tex_fmt[bound] = (uint16_t)ifmt;
+    if (w <= 0 || h <= 0 || w > 2048 || h > 2048) {
+      static int odd = 0;
+      if (odd++ < 20) {
+        char line[128];
+        snprintf(line, sizeof(line), "YTV_LIFECYCLE_GL_ODD_TEXTURE %dx%d ifmt=0x%x data=%d\n", (int)w,
+                 (int)h, (unsigned)ifmt, pixels != nullptr);
+        log_line(line);
+      }
+    }
+    static uint32_t seen[24];
+    static int nseen = 0;
+    uint32_t key = ((uint32_t)ifmt & 0xffff) << 16 ^ ((uint32_t)format & 0xffff) << 4 ^ ((uint32_t)type & 0xffff);
+    bool known = false;
+    for (int i = 0; i < nseen; i++) known |= seen[i] == key;
+    if (!known && nseen < 24) {
+      seen[nseen++] = key;
+      char line[128];
+      snprintf(line, sizeof(line), "YTV_GL_TEX_FORMAT ifmt=0x%x format=0x%x type=0x%x %dx%d data=%d\n",
+               (unsigned)ifmt, (unsigned)format, (unsigned)type, (int)w, (int)h, pixels != nullptr);
+      log_line(line);
+    }
+  }
   void* packed = repack_upload(w, h, format, type, pixels);
   uint64_t t0 = sceKernelGetSystemTimeWide();
   ::glTexImage2D(target, level, ifmt, w, h, border, format, type,
@@ -1040,6 +1189,24 @@ void ytv_gl_tex_sub_image_2d(GLenum target, GLint level, GLint x, GLint y,
                              GLsizei w, GLsizei h, GLenum format, GLenum type,
                              const void* pixels) {
   void* packed = repack_upload(w, h, format, type, pixels);
+  if (format == GL_ALPHA && pixels) {
+    // DIAGNOSTIC (verbose): content of glyph-atlas uploads.
+    static int logged = 0;
+    if (logged < 60) {
+      logged++;
+      const uint8_t* p = static_cast<const uint8_t*>(packed ? packed : pixels);
+      int zeros = 0, full = 0, mid = 0;
+      for (int i = 0; i < w * h; i++) {
+        if (p[i] == 0) zeros++; else if (p[i] == 255) full++; else mid++;
+      }
+      char line[160];
+      snprintf(line, sizeof(line),
+               "YTV_GL_A8_UPLOAD at=%d,%d %dx%d zero=%d full=%d mid=%d rowlen=%d align=%d\n",
+               (int)x, (int)y, (int)w, (int)h, zeros, full, mid, g_unpack_row_length,
+               g_unpack_alignment);
+      log_line(line);
+    }
+  }
   uint64_t t0 = sceKernelGetSystemTimeWide();
   ::glTexSubImage2D(target, level, x, y, w, h, format, type,
                     packed ? packed : pixels);
@@ -1311,6 +1478,35 @@ pthread_once_t once = PTHREAD_ONCE_INIT;
 #define SET_GL(field, fn) \
   gl_api.field = reinterpret_cast<decltype(gl_api.field)>(fn)
 
+// ---- Render-target diagnostics (verbose log only) --------------------------
+void diag_fb_tex(GLenum target, GLenum attachment, GLenum textarget, GLuint tex, GLint level) {
+  static int seen[16] = {0};
+  static int n = 0;
+  uint16_t fmt = tex < 4096 ? g_diag_tex_fmt[tex] : 0;
+  bool known = false;
+  for (int i = 0; i < n; i++) if (seen[i] == fmt) known = true;
+  if (!known && n < 16) {
+    seen[n++] = fmt;
+    char line[120];
+    snprintf(line, sizeof(line), "YTV_GL_FBO_ATTACH tex=%u internal_format=0x%x attachment=0x%x\n",
+             tex, (unsigned)fmt, (unsigned)attachment);
+    log_line(line);
+  }
+  ::glFramebufferTexture2D(target, attachment, textarget, tex, level);
+}
+GLenum diag_check_fb(GLenum target) {
+  GLenum r = ::glCheckFramebufferStatus(target);
+  if (r != GL_FRAMEBUFFER_COMPLETE) {
+    static int count = 0;
+    if (count++ < 20) {
+      char line[80];
+      snprintf(line, sizeof(line), "YTV_GL_FBO_INCOMPLETE status=0x%x\n", (unsigned)r);
+      log_line(line);
+    }
+  }
+  return r;
+}
+
 // ---- Lightweight frame profiler (logged only with verbose.txt) -----------
 inline uint64_t prof_now() { return sceKernelGetSystemTimeWide(); }
 inline void prof_frame_mark(uint64_t t) {
@@ -1328,11 +1524,15 @@ void prof_link_program(GLuint pr) {
   g_hb_link_us += prof_now() - t; g_hb_links++;
 }
 void prof_draw_arrays(GLenum m, GLint f, GLsizei c) {
-  uint64_t t = prof_now(); prof_frame_mark(t); g_hb_draws++; ::glDrawArrays(m, f, c);
+  uint64_t t = prof_now(); prof_frame_mark(t); g_hb_draws++;
+  if (g_startup_bg_active) ++g_startup_draws;
+  ::glDrawArrays(m, f, c);
   g_prof_draw_us += prof_now() - t; g_prof_draws++;
 }
 void prof_draw_elements(GLenum m, GLsizei c, GLenum ty, const void* i) {
-  uint64_t t = prof_now(); prof_frame_mark(t); g_hb_draws++; ::glDrawElements(m, c, ty, i);
+  uint64_t t = prof_now(); prof_frame_mark(t); g_hb_draws++;
+  if (g_startup_bg_active) ++g_startup_draws;
+  ::glDrawElements(m, c, ty, i);
   g_prof_draw_us += prof_now() - t; g_prof_draws++;
 }
 SbEglInterface egl_api = {};
@@ -1605,7 +1805,7 @@ void set_interfaces() {
   SET_GL(glBlendFuncSeparate, &::glBlendFuncSeparate);
   SET_GL(glBufferData, &::glBufferData);
   SET_GL(glBufferSubData, &::glBufferSubData);
-  SET_GL(glCheckFramebufferStatus, &::glCheckFramebufferStatus);
+  SET_GL(glCheckFramebufferStatus, &diag_check_fb);
   SET_GL(glClear, &::glClear);
   SET_GL(glClearColor, &::glClearColor);
   SET_GL(glClearDepthf, &::glClearDepthf);
@@ -1636,7 +1836,7 @@ void set_interfaces() {
   SET_GL(glFinish, &::glFinish);
   SET_GL(glFlush, &::glFlush);
   SET_GL(glFramebufferRenderbuffer, &::glFramebufferRenderbuffer);
-  SET_GL(glFramebufferTexture2D, &::glFramebufferTexture2D);
+  SET_GL(glFramebufferTexture2D, &diag_fb_tex);
   SET_GL(glFrontFace, &::glFrontFace);
   SET_GL(glGenBuffers, &::glGenBuffers);
   SET_GL(glGenerateMipmap, &::glGenerateMipmap);
@@ -1822,13 +2022,19 @@ GLboolean ytv_vitagl_ensure_initialized() {
 // Loader heartbeat: GL work since the previous call (frames presented, time
 // in eglSwapBuffers, first-draw->swap time, draw calls, shader compiles and
 // links with their time). Diagnostic; costs a few counters per call.
+extern "C" { volatile size_t g_vgl_free_vram = 0, g_vgl_free_ram = 0, g_vgl_free_phy = 0; }
 extern "C" void ytv_gl_stats(char* out, int n) {
   snprintf(out, n, "GL_STATS frames=%u swap_ms=%llu raster_ms=%llu draws=%u "
-           "compiles=%u compile_ms=%llu links=%u link_ms=%llu",
+           "compiles=%u compile_ms=%llu links=%u link_ms=%llu max_frame_ms=%llu "
+           "over20ms=%u over40ms=%u vgl_vram_kb=%u vgl_ram_kb=%u vgl_phy_kb=%u",
            (unsigned)g_hb_frames, (unsigned long long)(g_hb_swap_us / 1000),
            (unsigned long long)(g_hb_raster_us / 1000), (unsigned)g_hb_draws,
            (unsigned)g_hb_compiles, (unsigned long long)(g_hb_compile_us / 1000),
-           (unsigned)g_hb_links, (unsigned long long)(g_hb_link_us / 1000));
+           (unsigned)g_hb_links, (unsigned long long)(g_hb_link_us / 1000),
+           (unsigned long long)(g_hb_max_interval_us / 1000), (unsigned)g_hb_jank20,
+           (unsigned)g_hb_jank40, (unsigned)(g_vgl_free_vram >> 10), (unsigned)(g_vgl_free_ram >> 10),
+           (unsigned)(g_vgl_free_phy >> 10));
+  g_hb_max_interval_us = 0; g_hb_jank20 = g_hb_jank40 = 0;
   g_hb_frames = g_hb_draws = g_hb_compiles = g_hb_links = 0;
   g_hb_swap_us = g_hb_raster_us = g_hb_compile_us = g_hb_link_us = 0;
 }

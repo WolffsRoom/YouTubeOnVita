@@ -685,9 +685,11 @@ int main() {
         SbMediaIsBufferPoolAllocateOnDemand(),
         "Vita media buffers allocate on demand to avoid startup OOM");
   check(SbMediaGetAudioBufferBudget()==2*1024*1024 &&
-        SbMediaGetVideoBufferBudget(kSbMediaVideoCodecH264,854,480,8)==12*1024*1024 &&
-        SbMediaGetVideoBufferBudget(kSbMediaVideoCodecH264,1280,720,8)==20*1024*1024,
-        "Vita media budgets limit compressed buffering per resolution (480p 12, 720p 20 MiB)");
+        SbMediaGetVideoBufferBudget(kSbMediaVideoCodecH264,854,480,8)>=12*1024*1024 &&
+        SbMediaGetVideoBufferBudget(kSbMediaVideoCodecH264,854,480,8)<=36*1024*1024 &&
+        SbMediaGetVideoBufferBudget(kSbMediaVideoCodecH264,1280,720,8)>=20*1024*1024 &&
+        SbMediaGetVideoBufferBudget(kSbMediaVideoCodecH264,1280,720,8)<=60*1024*1024,
+        "Vita media budgets: per-resolution base, adaptive extra only from free heap");
   check(SbMediaGetProgressiveBufferBudget(kSbMediaVideoCodecH264,960,544,8)>=8*1024*1024 &&
         SbMediaGetMaxBufferCapacity(kSbMediaVideoCodecH264,960,544,8)>
            SbMediaGetAudioBufferBudget()+SbMediaGetVideoBufferBudget(

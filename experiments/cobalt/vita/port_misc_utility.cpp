@@ -6,6 +6,7 @@
 #include "starboard/string.h"
 #include "starboard/time_zone.h"
 #include "starboard/system.h"
+#include "starboard/event.h"
 #include "starboard/log.h"
 #include <psp2/net/netctl.h>
 #include <psp2/apputil.h>
@@ -95,6 +96,24 @@ bool SbSystemNetworkIsDisconnected(){
   if(sceNetCtlInetGetState(&state)<0)return true;
   return state!=SCE_NETCTL_STATE_CONNECTED;
 }
+// Network watcher (main thread, about once per second): reports connection
+// changes to Cobalt as kSbEventTypeOsNetworkDisconnected/Connected, which the
+// page receives as window "offline"/"online"; YouTube's player then resumes
+// after a Wi-Fi drop instead of staying on an error.
+int ytv_vita_network_poll(){
+  static int last=-1;  // -1 unknown, 0 disconnected, 1 connected
+  int now=SbSystemNetworkIsDisconnected()?0:1;
+  if(now==last)return 0;
+  int previous=last;
+  last=now;
+  if(previous<0)return 0;  // first observation: nothing changed yet
+  extern void ytv_vita_lifecycle_send(SbEventType type,void* data);
+  char line[80];
+  snprintf(line,sizeof(line),"YTV_LIFECYCLE_NETWORK %s\n",now?"connected":"disconnected");
+  SbLogRaw(line);
+  ytv_vita_lifecycle_send(now?kSbEventTypeOsNetworkConnected:kSbEventTypeOsNetworkDisconnected,nullptr);
+  return 1;
+}
 int64_t SbSystemGetTotalGPUMemory(){return 0;}
 int64_t SbSystemGetUsedGPUMemory(){return 0;}
 int SbSystemGetStack(void** out_stack,int stack_size){
@@ -112,7 +131,12 @@ bool SbSystemSignWithCertificationSecretKey(
 }
 bool SbSystemRaisePlatformError(SbSystemPlatformErrorType type,
    SbSystemPlatformErrorCallback callback,void* context){
-  (void)type;(void)callback;(void)context;
+  (void)callback;(void)context;
+  // Cobalt raises kSbSystemPlatformErrorTypeConnectionError ~1 s after a
+  // document load fails (BrowserModule::OnErrorRetry).
+  char line[96];
+  snprintf(line,sizeof(line),"YTV_LIFECYCLE_PLATFORM_ERROR type=%d\n",(int)type);
+  SbLogRaw(line);
   return false; // native system error UI is not implemented
 }
 // Set by the ELF loader: base address of the official libcobalt.so image.

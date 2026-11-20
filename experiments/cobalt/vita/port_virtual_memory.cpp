@@ -31,6 +31,9 @@ struct Mapping {
   // and the memblock is freed once every page has been released.
   uint8_t* released;
   uint32_t released_pages;
+  // Set once any range of this mapping was made executable (V8 JIT code
+  // space). Only such mappings need real permission changes afterwards.
+  bool exec_used;
 };
 Mapping maps[kMaxMaps]={};
 pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
@@ -56,8 +59,13 @@ unsigned prot(int flags) {
 }
 volatile int g_vm_log_lines=0;
 void vm_log(const char* fmt,...) __attribute__((format(printf,1,2)));
+volatile int g_vm_fail_lines=0;
 void vm_log(const char* fmt,...){
-  if(__sync_add_and_fetch(&g_vm_log_lines,1)>400)return;
+  // Failures (YTV_LIFECYCLE_VM_*) have their own budget: the 400-line cap
+  // used to be exhausted by routine map/unmap lines, hiding later failures.
+  if(strstr(fmt,"LIFECYCLE")){
+    if(__sync_add_and_fetch(&g_vm_fail_lines,1)>200)return;
+  } else if(__sync_add_and_fetch(&g_vm_log_lines,1)>400)return;
   char line[200];
   va_list ap;
   va_start(ap,fmt);
@@ -98,13 +106,13 @@ void* SbMemoryMap(int64_t size_bytes,int flags,const char *name) {
   }
   uint64_t size=0;
   if(!safe_align(size_bytes,&size) || !validate_flags(flags,false)){
-    vm_log("YTV_VM_MAP_FAIL n=%d reason=args size=%lld flags=%d\n",num,(long long)size_bytes,flags);
+    vm_log("YTV_LIFECYCLE_VM_MAP_FAIL n=%d reason=args size=%lld flags=%d\n",num,(long long)size_bytes,flags);
     return SB_MEMORY_MAP_FAILED;
   }
   SceUID uid=sceKernelAllocMemBlock("YTStarboardMap",
                SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,(SceSize)size,nullptr);
   if(uid<0){
-    vm_log("YTV_VM_MAP_FAIL n=%d reason=alloc err=0x%x size=%u\n",num,(unsigned)uid,(unsigned)size);
+    vm_log("YTV_LIFECYCLE_VM_MAP_FAIL n=%d reason=alloc err=0x%x size=%u\n",num,(unsigned)uid,(unsigned)size);
     return SB_MEMORY_MAP_FAILED;
   }
   void* base=nullptr;
@@ -112,11 +120,17 @@ void* SbMemoryMap(int64_t size_bytes,int flags,const char *name) {
     sceKernelFreeMemBlock(uid);
     return SB_MEMORY_MAP_FAILED;
   }
-  // Some users request read-only from the start. Do not leave it writable.
-  if(!(flags&kSbMemoryMapProtectWrite)) {
+  // Read-only mappings are protected; "reserved" (flags == 0) mappings are
+  // NOT: they stay RW. A Vita memblock is committed anyway, so PROT_NONE
+  // saved nothing, and it was the cause of the recurring V8 data aborts
+  // (v0.25, v0.29, first-login crash, Lite v0.45, v0.47 at video start: a
+  // translation fault, DFSR=7, on a page of such a block that V8 had already
+  // committed and put objects on). Sub-range permission changes on a live
+  // memblock are not reliable through kuKernelMemProtect.
+  if(flags==kSbMemoryMapProtectRead) {
     int pr=kuKernelMemProtect(base,(SceSize)size,prot(flags));
     if(pr<0) {
-      vm_log("YTV_VM_MAP_FAIL n=%d reason=protect err=0x%x flags=%d\n",num,(unsigned)pr,flags);
+      vm_log("YTV_LIFECYCLE_VM_MAP_FAIL n=%d reason=protect err=0x%x flags=%d\n",num,(unsigned)pr,flags);
       sceKernelFreeMemBlock(uid);
       return SB_MEMORY_MAP_FAILED;
     }
@@ -124,10 +138,10 @@ void* SbMemoryMap(int64_t size_bytes,int flags,const char *name) {
   pthread_mutex_lock(&lock);
   int index=-1;
   for(int i=0;i<kMaxMaps;i++)if(!maps[i].base){index=i;break;}
-  if(index>=0)maps[index]={base,uid,(uint64_t)size_bytes,size};
+  if(index>=0)maps[index]={base,uid,(uint64_t)size_bytes,size,nullptr,0,false};
   pthread_mutex_unlock(&lock);
   if(index<0) {
-    vm_log("YTV_VM_MAP_FAIL n=%d reason=table_full\n",num);
+    vm_log("YTV_LIFECYCLE_VM_MAP_FAIL n=%d reason=table_full\n",num);
     sceKernelFreeMemBlock(uid);
     return SB_MEMORY_MAP_FAILED;
   }
@@ -151,7 +165,7 @@ bool SbMemoryUnmap(void* address,int64_t size_bytes) {
   }
   if(index<0) {
     pthread_mutex_unlock(&lock);
-    vm_log("YTV_VM_UNMAP_FAIL %p size=%lld not inside a mapping\n",address,(long long)size_bytes);
+    vm_log("YTV_LIFECYCLE_VM_UNMAP_FAIL %p size=%lld not inside a mapping\n",address,(long long)size_bytes);
     return false;
   }
   Mapping& m=maps[index];
@@ -167,9 +181,15 @@ bool SbMemoryUnmap(void* address,int64_t size_bytes) {
       m.released=(uint8_t*)calloc((total_pages+7)/8,1);
       if(!m.released){pthread_mutex_unlock(&lock);return false;}
     }
-    // Released pages must fault like unmapped memory.
-    result=kuKernelMemProtect(address,(SceSize)rounded,KU_KERNEL_PROT_NONE);
-    if(result>=0) {
+    // Released pages are NOT protected any more. Hardware crash dumps
+    // (v0.25 and v0.29) show a data abort in V8's object-type checks on a
+    // page of such a block that was readable again in the dump; the suspected
+    // cause is that removing access from a sub-range of a live block
+    // (kuKernelMemProtect PROT_NONE) briefly affected neighbouring live pages.
+    // Nothing reads memory it released; the block is freed once all of its
+    // pages are released.
+    result=0;
+    {
       for(uint32_t p=first;p<first+count;p++) {
         if(!(m.released[p/8]&(1u<<(p%8)))) {
           m.released[p/8]|=(uint8_t)(1u<<(p%8));
@@ -191,7 +211,7 @@ bool SbMemoryProtect(void* address,int64_t size_bytes,int flags) {
   if(flags&kSbMemoryMapProtectExec)
     vm_log("YTV_VM_PROTECT_EXEC %p size=%lld flags=%d\n",address,(long long)size_bytes,flags);
   if(!address || size_bytes<=0 || !validate_flags(flags,true)){
-    vm_log("YTV_VM_PROTECT_REJECT %p size=%lld flags=%d\n",address,(long long)size_bytes,flags);
+    vm_log("YTV_LIFECYCLE_VM_PROTECT_REJECT %p size=%lld flags=%d\n",address,(long long)size_bytes,flags);
     return false;
   }
   uintptr_t begin=(uintptr_t)address;
@@ -200,8 +220,9 @@ bool SbMemoryProtect(void* address,int64_t size_bytes,int flags) {
   if(!safe_align(size_bytes,&rounded))return false;
   pthread_mutex_lock(&lock);
   bool within=false;
+  bool kernel=false;  // a real page-table change is needed
   for(int i=0;i<kMaxMaps;i++) {
-    const Mapping& m=maps[i];
+    Mapping& m=maps[i];
     if(!m.base)continue;
     uintptr_t b=(uintptr_t)m.base;
     if(begin>=b && (uint64_t)(begin-b)+rounded<=m.aligned) {
@@ -212,13 +233,21 @@ bool SbMemoryProtect(void* address,int64_t size_bytes,int flags) {
         for(uint32_t p=first;p<first+(uint32_t)(rounded/kPageSize);p++)
           if(m.released[p/8]&(1u<<(p%8))){within=false;break;}
       }
+      // Data mappings are RW for their whole life (see SbMemoryMap): commit
+      // (R/RW) and decommit (0) requests need no page-table change. Only
+      // JIT code mappings switch RW <-> RX for real.
+      if(within && (flags&kSbMemoryMapProtectExec)) m.exec_used=true;
+      kernel=within && m.exec_used && flags!=0;
       break;
     }
   }
-  int result=within?kuKernelMemProtect(address,(SceSize)rounded,prot(flags)):-1;
+  // Data mappings: every request is acknowledged without touching the page
+  // tables (they stay RW). Mappings that held JIT code: R/RW/RX go to the
+  // kernel; decommit (0) is acknowledged, the pages stay mapped but unused.
+  int result=!within?-1:!kernel?0:kuKernelMemProtect(address,(SceSize)rounded,prot(flags));
   pthread_mutex_unlock(&lock);
   if(result<0)
-    vm_log("YTV_VM_PROTECT_FAIL %p size=%lld flags=%d within=%d err=0x%x\n",address,(long long)size_bytes,flags,within,(unsigned)result);
+    vm_log("YTV_LIFECYCLE_VM_PROTECT_FAIL %p size=%lld flags=%d within=%d err=0x%x\n",address,(long long)size_bytes,flags,within,(unsigned)result);
   return result>=0;
 }
 } // extern C
