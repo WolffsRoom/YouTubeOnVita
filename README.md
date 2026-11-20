@@ -23,23 +23,19 @@ _Unofficial client for PS Vita_
 
 > [!IMPORTANT]
 > **This is the genuine YouTube on TV frontend running through Cobalt**, not a recreated or simulated interface.
->
-> **Known issue (v0.58):** Video switching at 720p, especially during an MP3 download, may occasionally cause a crash. Please provide logs if you experience this.
 
 ---
 
 <details open>
 <summary><b>Overview</b></summary>
 
-- [What Is YouTubeOnVita?](#overview)
+- [Overview](#overview)
 - [Download — Full & Lite](#download)
-- [Project Status](#project-status)
-- [Features and Compatibility](#features-and-compatibility)
+- [Features](#features)
 - [Controls](#controls)
 - [Cobalt and FPS](#cobalt-and-fps)
 - [Native Add-ons](#native-add-ons)
-- [MP4 / MP3 Downloads](#mp4--mp3-downloads)
-- [Screenshots and Demonstrations](#screenshots-and-demonstrations)
+- [Screenshots](#screenshots)
 
 </details>
 
@@ -47,29 +43,24 @@ _Unofficial client for PS Vita_
 <summary><b>Development</b></summary>
 
 - [How It Works](#how-it-works)
-- [Technical Milestones](#technical-milestones)
 - [Video and Audio](#video-and-audio)
 - [Google Sign-in and Security](#google-sign-in-and-security)
-- [AdBlock Limitations](#adblock-limitations)
-- [Known Issues and Limitations](#known-issues-and-limitations)
+- [Known Limitations](#known-limitations)
 - [Building and Testing](#building-and-testing)
-- [Project Structure](#project-structure)
 - [Development History](#development-history)
-- [Roadmap](#roadmap)
 - [Credits and Disclaimer](#credits-and-disclaimer)
 
 </details>
 
 ---
 
-
 ## Overview
 
-**YouTubeOnVita** brings the actual **YouTube on TV** application to **PlayStation Vita**. Instead of building a lookalike, this project adapts **Google Cobalt**, the **Starboard 15** platform layer and the Vita's native services.
+**YouTubeOnVita** runs the genuine **YouTube on TV** interface on **PlayStation Vita**, powered by Cobalt and Starboard 15. It is **not** a custom recreation.
 
-Browse, search, sign in, navigate with physical controls or touch and watch videos on the Vita's **960 × 544** display. A standalone PC or streaming proxy is not required.
+Browse, search, sign in and watch videos using native buttons and touchscreen input, without a companion PC or streaming server.
 
-The original handmade prototype (`legacy/native-mock-v001/`) remains archived; the released client uses the real TV frontend.
+The early handmade prototype is archived in `legacy/native-mock-v001/` and is not part of this release.
 
 ---
 
@@ -88,73 +79,36 @@ Also available through **[Wolff's Room](https://wolffsroom.github.io/WolffsRoomS
 
 ---
 
-## Project Status
+## Features
 
-<div align="center">
+- The **real YouTube on TV** interface: browsing, search, sign-in and player controls.
+- Native **buttons, touchscreen and microphone integration**.
+- **H.264/AAC playback up to 720p**, including compatible 60 FPS streams; optional Full HD where supported.
+- Native **Add-ons** for screenshots, sleep timer, display and sound settings.
+- **MP4 video and MP3 audio downloads** with square artwork on new MP3s.
+- **Encrypted local session data**, custom LiveArea and animated startup.
 
-![Current release](https://img.shields.io/badge/FIRST%20RELEASE-v0.58-2ea44f?style=flat-square)
-![Two editions](https://img.shields.io/badge/EDITIONS-FULL%20%2B%20LITE-006fcd?style=flat-square)
-![Hardware testing](https://img.shields.io/badge/REAL%20VITA-TESTED-yellow?style=flat-square)
-
-</div>
-
-**First public release: November 20, 2026.** The genuine YouTube frontend is playable on PS Vita hardware; development continues to improve video switching and stability.
-
-| Component | Status | Notes |
-|:--|:--|:--|
-| Cobalt Evergreen / Starboard 15 | **Running** | Genuine YouTube on TV application, not a replacement UI |
-| Networking / HTTPS | **Working** | Authenticated, encrypted network transport |
-| D-pad, buttons and touch | **Working** | Native controls and touchscreen integration |
-| Native microphone | **Integrated** | Voice-feature availability depends on YouTube |
-| Video and audio | **Working** | Hardware H.264 / AAC, up to 720p; 60 FPS on compatible streams |
-| Sign-in persistence | **Implemented** | Local session data encrypted at rest |
-| Add-ons | **Available** | Player, downloads, display and other settings |
-| Local downloads | **Available** | MP4 video / MP3 audio |
-| Full / Lite editions | **Released** | Two VPKs with distinct RAM profiles |
-| HD video switching | **Under investigation** | Occasional crashes; see limitations below |
-
-> [!NOTE]
-> YouTube controls its own service, interfaces and sign-in policies. This project is **not an officially certified YouTube device**; some features may change or stop working independently of the port.
-
----
-
-## Features and Compatibility
-
-### Included in v0.58
-
-- **Authentic YouTube on TV** browsing, search, player controls and sign-in flow.
-- Native PS Vita **D-pad, face buttons and front touchscreen** support.
-- Native **microphone** integration for supported voice interactions.
-- **H.264 video / AAC audio** playback up to 720p, including compatible 60 FPS streams; Full HD remains an optional experimental setting.
-- Persistent session data and preferences, with **encrypted local storage**.
-- Custom **LiveArea**, animated startup screen and optional interface sounds.
-- Native **Add-ons menu**, including screenshots, sleep timer, display adjustments and basic performance information.
-- **MP4 video and MP3 audio downloads**, with square album artwork on newly downloaded MP3s.
-
-### Compatibility notes
-
-The Vita's display is **960 × 544**, so a decoded 720p video is downscaled to fit. Full uses more RAM to favor video playback; Lite limits memory use but may need lower video quality on demanding streams. DRM-protected content and unsupported codecs are not playable.
+The Vita display is **960 × 544**, so 720p video is scaled down to fit. Some formats and protected content are unsupported.
 
 ---
 
 ## Controls
 
-YouTubeOnVita forwards native input to Cobalt; YouTube determines how individual buttons work on each screen.
+<table align="center">
+<thead><tr><th align="center">Control</th><th align="center">Function</th></tr></thead>
+<tbody>
+<tr><td align="center"><img src="assets/sony-buttons/up.png" alt="up" width="22"> <img src="assets/sony-buttons/left.png" alt="left" width="22"> <img src="assets/sony-buttons/down.png" alt="down" width="22"><br>D-pad</td><td align="center">Navigate menus and video controls</td></tr>
+<tr><td align="center"><img src="assets/sony-buttons/cross.png" alt="cross" width="22"></td><td align="center">Select / confirm</td></tr>
+<tr><td align="center"><img src="assets/sony-buttons/circle.png" alt="circle" width="22"></td><td align="center">Back / close</td></tr>
+<tr><td align="center"><img src="assets/sony-buttons/square.png" alt="square" width="22"> <img src="assets/sony-buttons/triangle.png" alt="triangle" width="22"></td><td align="center">Context-dependent YouTube controls</td></tr>
+<tr><td align="center"><img src="assets/sony-buttons/Select.png" alt="Select" width="52"></td><td align="center">Open / close native Add-ons</td></tr>
+<tr><td align="center"><img src="assets/sony-buttons/touchpad.png" alt="touchpad" width="38"><br>Front touchscreen</td><td align="center">Tap: Select · Swipe: Navigate<br>Two-finger tap: Back · Three-finger tap: Add-ons</td></tr>
+<tr><td align="center">L / R</td><td align="center">Player navigation (when enabled)</td></tr>
+<tr><td align="center"><img src="assets/sony-buttons/Start.png" alt="Start" width="52"></td><td align="center">Application-dependent</td></tr>
+</tbody>
+</table>
 
-| Vita control | Function |
-|:--|:--|
-| D-pad | Navigate menus and video controls |
-| Cross (**×**) | Confirm / select |
-| Circle (**○**) | Back / dismiss |
-| Front touchscreen: tap | Select an item under the finger |
-| Front touchscreen: swipe | Navigate or scroll |
-| Front touchscreen: two-finger tap | Back |
-| **SELECT** | Open / close native Add-ons |
-| Three-finger tap | Open native Add-ons |
-| L / R | Player navigation when enabled in Add-ons |
-| START / other buttons | Application-dependent |
-
-The native Add-ons menu has its own button controls. Touch and physical buttons can be used together.
+<p align="center"><sub>Controls depend on the current YouTube screen.</sub></p>
 
 ---
 
@@ -166,45 +120,50 @@ Cobalt is designed for television applications. **It does not continuously redra
 
 **Low-clock test:** video playback was also tested at **222 MHz CPU / 111 MHz GPU**, with satisfactory playback for the tested content.
 
-For more about the runtime, see the [Cobalt project](https://github.com/youtube/cobalt).
-
 ---
 
 ## Native Add-ons
 
-The built-in **Add-ons** menu adds Vita-specific controls without replacing the original YouTube UI. Open it with **SELECT** or a three-finger tap.
+Open **Add-ons** with **SELECT** or a three-finger tap. These tools extend the original YouTube interface without replacing it.
 
-| Menu | What it offers |
+| Section | Options |
 |:--|:--|
-| **Player settings** | Screenshot capture, sleep timer, Black Screen and Darken Screen |
-| **Download** | Download the selected video as MP4 or convert its audio to MP3 |
-| **Settings** | Partial AdBlock, download quality, L/R controls, input lock and language |
-| **Screen and info** | Full HD option, performance information, clock, battery and UI sounds |
-| **Vita Settings** | Shortcut to system Settings, subject to available memory |
+| **Player settings** | Screenshots, sleep timer, Black Screen and Darken Screen |
+| **Download** | MP4 video or locally encoded MP3 audio |
+| **Settings** | Download quality, partial AdBlock, L/R controls, input lock and language |
+| **Screen and info** | Full HD option, performance, clock, battery and UI sounds |
+| **Vita Settings** | System Settings shortcut (subject to available memory) |
 
-<p align="center">
-  <img src="assets/prints/addons-home.png" alt="YouTube native Add-ons menu" width="46%">
-  <img src="assets/prints/addons-player.png" alt="Player settings" width="46%">
-  <img src="assets/prints/addons-download.png" alt="MP4 and MP3 downloads" width="46%">
-  <img src="assets/prints/addons-settings.png" alt="Add-ons settings" width="46%">
-  <img src="assets/prints/addons-display.png" alt="Display and performance settings" width="46%">
-</p>
+<table align="center">
+<tbody>
+<tr>
+<td align="center"><a href="assets/prints/addons-home.png"><img src="assets/prints/addons-home.png" alt="Native Add-ons main menu" width="235"></a><br><sub>Add-ons</sub></td>
+<td align="center"><a href="assets/prints/addons-player.png"><img src="assets/prints/addons-player.png" alt="Player settings" width="235"></a><br><sub>Player</sub></td>
+<td align="center"><a href="assets/prints/addons-download.png"><img src="assets/prints/addons-download.png" alt="MP4 and MP3 downloads" width="235"></a><br><sub>Downloads</sub></td>
+</tr>
+<tr>
+<td align="center"><a href="assets/prints/addons-settings.png"><img src="assets/prints/addons-settings.png" alt="Settings" width="235"></a><br><sub>Settings</sub></td>
+<td align="center"><a href="assets/prints/addons-display.png"><img src="assets/prints/addons-display.png" alt="Screen and information" width="235"></a><br><sub>Screen &amp; Info</sub></td>
+<td align="center"><sub>Captured in Vita3K</sub></td>
+</tr>
+</tbody>
+</table>
+
+### MP4 and MP3 downloads
+
+Save available videos as **MP4** or encode audio locally to **MP3 (160 kbps)**. New MP3s may include **1:1 square cover art**. Files are saved to `ux0:data/youtubevita/downloads/`.
+
+Available qualities depend on YouTube's provided streams. Only download content you have permission to save.
+
+### Partial AdBlock
+
+The optional AdBlock filters a small list of advertising domains. It **cannot reliably block YouTube ads delivered through first-party video endpoints**.
 
 ---
 
-## MP4 / MP3 Downloads
+## Screenshots
 
-Use **Add-ons → Download** to save available videos as **MP4** or encode audio locally as **MP3** (160 kbps). New MP3 downloads can include **1:1 square cover artwork** when a thumbnail is available.
-
-Files are stored in `ux0:data/youtubevita/downloads/`. MP4 resolution depends on the formats YouTube provides for that video, and a higher-quality stream may not be downloadable as a single MP4.
-
-Downloads are subject to format, service and content restrictions. Only save media you have permission to download.
-
----
-
-## Screenshots and Demonstrations
-
-Real images from **Vita3K**, showing the Cobalt-rendered YouTube on TV interface and native features.
+Screenshots of the actual YouTube interface captured in **Vita3K**.
 
 | Home / browsing | YouTube Music |
 |:--:|:--:|
@@ -248,39 +207,13 @@ The Vita port provides the **Starboard** implementation required to connect Coba
 
 ### Native runtime and loader
 
-The project includes a native ARM32 loader for the matching **Cobalt Evergreen 5.50.2 / Starboard 15** binary. It performs segment loading, relocation, external symbol resolution, executable-memory protection, C++ static initialization and dispatch of Cobalt's native event entry point.
+The project uses a native ARM32 loader for the matching **Cobalt Evergreen 5.50.2 / Starboard 15** binary. It performs segment loading, relocation, external symbol resolution, executable-memory protection, C++ static initialization and dispatch of Cobalt's native event entry point.
 
-This is more than a static webpage wrapper: Cobalt runs application code and communicates with native Vita interfaces through Starboard. It is also **not** a port of the entire Chromium browser.
+The runtime connects YouTube's application logic to Vita system services through Starboard.
 
 ### Graphics
 
 The graphics implementation connects Cobalt's EGL/GLES expectations to **VitaGL** and the Vita graphics stack. It supplies the EGL interfaces required by the browser, translates missing GLES behavior where possible, and manages shader compilation and caching. The port has been tested rendering YouTube interface elements, thumbnails and video frames in Vita3K.
-
-### Identity and service compatibility
-
-During development, a **console-compatible device identity** was used to evaluate whether YouTube would serve the TV interface. The project does not contain Google's certification keys or claim to be an officially certified device. Service compatibility is not guaranteed; device restrictions, login policies and video availability may change independently of this project.
-
----
-
----
-
-## Technical Milestones
-
-The original project's technical milestones are preserved below as development history, with the public-release work added.
-
-| Milestone | Result / evidence |
-|:--|:--|
-| ARM32 Cobalt ELF loading | Dynamic relocations and C++ initialization validated in Vita3K |
-| Starboard backend | Filesystem, networking, event scheduling, synchronization, input and native services |
-| EGL / GLES bridge | Browser rendering and presentation through VitaGL |
-| Native media | H.264 / AAC playback through Vita decoders |
-| Touch input | Tap and gesture mapping on Vita |
-| v0.22 audio milestone | AAC framing fix, media clock and autoplay validated in Vita3K |
-| v0.25–v0.26 | Wait-loop and kernel-object fixes; storage persistence improvements |
-| v0.56–v0.57 | LiveArea, native startup, Add-ons, downloads, stability diagnostics |
-| **v0.58 First Release** | **Full and Lite VPKs built; both booted in Vita3K; screenshot capture validated** |
-
-Diagnostic and test code is available under `experiments/cobalt/vita/` and `tools/`. Emulator results alone do not guarantee identical behavior on hardware.
 
 ---
 
@@ -290,19 +223,7 @@ Diagnostic and test code is available under `experiments/cobalt/vita/` and `tool
 
 Cobalt supplies encoded media samples to the Vita's **SbPlayer** implementation, which uses the native H.264 decoder and submits YUV video surfaces to the GPU.
 
-```text
-YouTube stream / Cobalt
-          |
-  SbPlayerWriteSamples
-          |
-   SceAvcdec (H.264)
-          |
-    GPU video surface
-          |
-   VitaGL / Vita display
-```
-
-**720p playback is decoded at 1280 × 720** when available, then scaled to the **960 × 544** Vita display. Support for video at **60 FPS** depends on the source and runtime performance. Full HD uses a separate experimental non-game decoder path and is not guaranteed to work.
+The Vita's hardware decoder accepts compatible **1280 × 720** streams. Full HD is an optional mode and is not guaranteed on every device.
 
 ### Audio
 
@@ -326,24 +247,16 @@ These measures help protect local data but do **not** make the client an officia
 
 ---
 
-## AdBlock Limitations
-
-The built-in **AdBlock is partial**: it filters a small set of known advertising domains through DNS handling. **It cannot reliably block YouTube ads served from first-party video endpoints**, so ads may still appear. It is not comparable to a full browser-based ad-blocking extension.
-
----
-
-## Known Issues and Limitations
+## Known Limitations
 
 > [!WARNING]
-> **Known v0.58 issue:** Switching 720p videos, particularly while downloading MP3 audio, may crash the application. The underlying Cobalt memory-access fault is still being investigated.
+> **v0.58:** Switching HD videos, particularly during MP3 downloads, can cause a crash. This issue is under investigation.
 
-- **Memory:** Full reserves extended RAM; some other apps or system screens may not open while it runs. Lite leaves more RAM available, with tighter video budgets.
-- **Playback:** 720p and 60 FPS depend on the stream and device conditions; 1080p is not a guaranteed playback mode.
-- **AdBlock:** Domain filtering is limited and does not remove every ad.
-- **Service compatibility:** Uncertified YouTube clients can be affected by future service-side changes.
-- **Content:** Some encodings, DRM-protected videos and special media formats are unsupported.
+- **YouTube Full** reserves more RAM; **Lite** leaves more available for suspended applications.
+- Certain video formats, DRM-protected content and Full HD streams may not work.
+- The YouTube service may change on uncertified devices.
 
-If you find a crash, include steps to reproduce and the relevant logs from `ux0:data/youtubevita/`.
+For crash reports, share reproduction steps and relevant `ux0:data/youtubevita/` logs, **not stored account or session data**.
 
 ---
 
@@ -356,7 +269,7 @@ If you find a crash, include steps to reproduce and the relevant logs from `ux0:
 - Docker and the `vitasdk/vitasdk:latest` image.
 - Git with submodule support, CMake and Python 3.
 - Matching, legally obtained **Cobalt Evergreen / Starboard 15** runtime and required assets (not all are redistributable in this repository).
-- Required VitaGL, VitaSDK, FFmpeg, TLS and codec libraries.
+- Required VitaGL, VitaSDK, TLS and media dependencies.
 
 ### Local build
 
@@ -383,54 +296,9 @@ The script can also use `-Configuration Debug`. It puts the resulting packages i
 
 **Note:** The proprietary Cobalt runtime and certain supporting assets are intentionally not included in the public source. A fresh clone alone may not produce a VPK until these prerequisites are supplied through authorized means.
 
-### Run tests in Vita3K
+### Vita3K testing
 
-```powershell
-./tools/test_starboard_vita3k.ps1
-./tools/test_relocations_vita3k.ps1
-./tools/test_avplayer_vita3k.ps1
-./tools/test_cobalt_boot_vita3k.ps1 -Seconds 90
-```
-
-The boot test records logs and optional captures under `tools/capture/cobalt-boot-*/`. Results on hardware can differ.
-
-### Device logs and diagnostics
-
-Device logs and local preferences are written beneath:
-
-```text
-ux0:data/youtubevita/
-```
-
-Relevant files include `cobalt_boot.log` and `starboard15.log`. Do not publish session storage files or other private account records when reporting a problem.
-
----
-
-## Project Structure
-
-```text
-YouTubeVita/
-├── assets/
-│   ├── livearea/             LiveArea background, icon and startup image
-│   └── prints/              Vita3K screenshots used in this README
-├── experiments/cobalt/
-│   ├── evergreen/            Local runtime research and staging
-│   └── vita/
-│       ├── port_*.cpp        Native Starboard services, media and Add-ons
-│       ├── platform15.cpp    Platform integration
-│       ├── relocate_elf.c    ARM32 Cobalt loader
-│       └── assets/           Startup animation and UI sounds
-├── third_party/              Third-party components and submodules
-├── tools/                    Build scripts, tests and capture utilities
-├── docs/                     Historical development notes and release text
-├── legacy/native-mock-v001/  Archived handmade UI prototype
-├── build-youtube/            Local normal build output (not committed)
-├── build-youtube-lite/       Local Lite build output (not committed)
-├── current/                  Locally packaged VPKs (not committed)
-└── CMakeLists.txt
-```
-
-Avoid committing runtime binaries, crash dumps, account data, build folders or local toolchains.
+After building, run `./tools/test_cobalt_boot_vita3k.ps1 -Seconds 90`. Diagnostic logs and captures are stored under `tools/capture/cobalt-boot-*/`. Results on real hardware may differ.
 
 ---
 
@@ -450,21 +318,6 @@ Avoid committing runtime binaries, crash dumps, account data, build folders or l
 | **v0.58 — First Release** | **Public Full and Lite VPKs, new README, screenshots and GitHub release** |
 
 Older detailed technical notes are preserved in [Development Notes Archive](docs/DEVELOPMENT_NOTES_ARCHIVE.md).
-
----
-
-## Roadmap
-
-- [x] Port the genuine Cobalt / Starboard YouTube frontend to PS Vita.
-- [x] Integrate gamepad navigation, touchscreen and basic microphone input.
-- [x] Implement native H.264 / AAC playback with up to 720p streams.
-- [x] Add persistent encrypted session storage.
-- [x] Add native Add-ons, screenshots, UI sounds and MP4/MP3 downloads.
-- [x] Release **YouTube Full** and **YouTube Lite** VPKs (v0.58).
-- [ ] Investigate and resolve crashes during HD video switching and concurrent MP3 download.
-- [ ] Improve memory management, suspend/resume and error recovery.
-- [ ] Expand hardware and long-session compatibility testing.
-- [ ] Continue performance and graphics improvements.
 
 ---
 
