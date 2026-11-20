@@ -1,8 +1,21 @@
-<p align="center">
-  <a href="https://github.com/WolffsRoom/YouTubeOnVita">
-    <img src="https://github.com/user-attachments/assets/d361a00d-8661-43fb-97ec-bf35e705b7e8" alt="Logo YouTube On PSVita" width="400" style="background: transparent; -webkit-filter: drop-shadow(5px 5px 5px #222); filter: drop-shadow(5px 5px 5px #222);">
-  </a>
-</p>
+
+<div align="center">
+  <picture>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="https://github.com/user-attachments/assets/71d14b35-5d7d-43ef-a3bd-1371da640aae"
+    />
+    <source
+      media="(prefers-color-scheme: light)"
+      srcset="https://github.com/user-attachments/assets/e60897d8-5614-4b38-9751-020c74b78062"
+    />
+    <img
+      src="https://github.com/user-attachments/assets/e60897d8-5614-4b38-9751-020c74b78062"
+      alt="YouTube on PS Vita"
+      width="60%"
+    />
+  </picture>
+</div>
 
 <div align="center">
 
@@ -144,7 +157,6 @@ Open **Add-ons** with **SELECT** or a three-finger tap. These tools extend the o
 <tr>
 <td align="center"><a href="assets/prints/addons-settings.png"><img src="assets/prints/addons-settings.png" alt="Settings" width="235"></a><br><sub>Settings</sub></td>
 <td align="center"><a href="assets/prints/addons-display.png"><img src="assets/prints/addons-display.png" alt="Screen and information" width="235"></a><br><sub>Screen &amp; Info</sub></td>
-<td align="center"><sub>Captured in Vita3K</sub></td>
 </tr>
 </tbody>
 </table>
@@ -309,13 +321,13 @@ After building, run `./tools/test_cobalt_boot_vita3k.ps1 -Seconds 90`. Diagnosti
 | **v0.01 — Prototype** | Original handmade interface, later archived in favor of real YouTube on TV |
 | **Starboard foundation** | ARM ELF loader, native filesystem, networking and event loop |
 | **Cobalt bootstrap** | Cobalt event entry point working in Vita3K |
-| **v0.18–v0.20** | Navigation, early hardware feedback, performance and runtime improvements |
-| **v0.21–v0.22** | Native media player, microphone capture, AAC/ADTS fix |
-| **v0.23–v0.26** | Touch gestures, hardware decode tiers, synchronization and session persistence |
-| **v0.27–v0.28** | LiveArea graphics and packaging improvements |
-| **v0.34–v0.55** | YouTube frontend integration, Add-ons, downloads and additional testing |
-| **v0.56–v0.57** | Unified build experiments, HD playback diagnostics, animated startup and MP3 cover art |
-| **v0.58 — First Release** | **Public Full and Lite VPKs, new README, screenshots and GitHub release** |
+| **v0.18 – v0.20** | Navigation, early hardware feedback, performance and runtime improvements |
+| **v0.21 – v0.22** | Native media player, microphone capture, AAC/ADTS fix |
+| **v0.23 – v0.26** | Touch gestures, hardware decode tiers, synchronization and session persistence |
+| **v0.27 – v0.28** | LiveArea graphics and packaging improvements |
+| **v0.34 – v0.55** | YouTube frontend integration, Add-ons, downloads and additional testing |
+| **v0.56 – v0.57** | Unified build experiments, HD playback diagnostics, animated startup and MP3 cover art |
+| **v0.58 - First Release** | **Public Full and Lite VPKs, new README, screenshots and GitHub release** |
 
 Older detailed technical notes are preserved in [Development Notes Archive](docs/DEVELOPMENT_NOTES_ARCHIVE.md).
 
@@ -327,17 +339,21 @@ Older detailed technical notes are preserved in [Development Notes Archive](docs
 
 This project builds upon the work of:
 
-- [Cobalt](https://github.com/youtube/cobalt) — original HTML5 runtime and Starboard architecture.
-- [VitaSDK](https://vitasdk.org/) — homebrew toolchain and Vita interfaces.
-- [vitaGL](https://github.com/Rinnegatamante/vitaGL) — Vita graphics integration.
-- [Vita3K](https://vita3k.org/) — emulator for development and captures.
-- [kubridge](https://github.com/TheOfficialFloW/kubridge) — kernel bridge used for executable-memory integration.
+- [Cobalt](https://github.com/youtube/cobalt) - original HTML5 runtime and Starboard architecture.
+- [VitaSDK](https://vitasdk.org/) - homebrew toolchain and Vita interfaces.
+- [vitaGL](https://github.com/Rinnegatamante/vitaGL) - Vita graphics integration.
+- [Vita3K](https://vita3k.org/) - emulator for development and captures.
+- [kubridge](https://github.com/TheOfficialFloW/kubridge) - kernel bridge used for executable-memory integration.
+
+### AI NOTICE
+
+This project was created using AI (Chat GPT Plus and Claude Code Opus 5.5). 
 
 ### Visual and audio references
 
-- [YouTube Brand Resources](https://brand.youtube/) — branding and visual reference.
-- [YouTube Splash Screen Animation on LottieFiles](https://lottiefiles.com/free-animation/youtube-splash-screen-animation-8wjVJQIQHQ) — inspiration/reference for the adapted startup sequence.
-- [iOS System Sounds](https://github.com/extratone/iOSSystemSounds/) — reference/source for the optional UI sound set.
+- [YouTube Brand Resources](https://brand.youtube/) - branding and visual reference.
+- [YouTube Splash Screen Animation on LottieFiles](https://lottiefiles.com/free-animation/youtube-splash-screen-animation-8wjVJQIQHQ) - inspiration/reference for the adapted startup sequence.
+- [iOS System Sounds](https://github.com/extratone/iOSSystemSounds/) - reference/source for the optional UI sound set.
 
 All trademarks, branded assets, music, and third-party libraries remain the property of their respective owners. Their respective licenses and redistribution conditions apply; see `LICENSES.md` and dependency notices.
 
