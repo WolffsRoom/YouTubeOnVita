@@ -20,60 +20,65 @@
 <div align="center">
 
 _Unofficial client for PS Vita_
-
 **The real YouTube on TV experience, brought to PlayStation Vita through Cobalt.**
 
-[![Status](https://img.shields.io/badge/STATUS-FIRST%20RELEASE-2ea44f?style=for-the-badge)](#download)
-[![Platform](https://img.shields.io/badge/PLATFORM-PS%20VITA-006fcd?style=for-the-badge&logo=playstation&logoColor=white)](#overview)
-[![Engine](https://img.shields.io/badge/ENGINE-COBALT%20%2B%20STARBOARD-455a64?style=for-the-badge)](#how-it-works)
-[![Build](https://img.shields.io/badge/BUILD-v0.58%20FULL%20%2B%20LITE-006fcd?style=for-the-badge)](#download)
-
-*An independent homebrew project by [Wolff's Room](https://github.com/WolffsRoom).*
-
-*Not affiliated with Google, YouTube, or Sony.*
-
 </div>
+<br>
+
+**YouTubeOnVita** runs the genuine **YouTube on TV** interface on **PlayStation Vita**, powered by Cobalt and Starboard 15. It is **not** a custom recreation. Browse, search, sign in and watch videos using native buttons and touchscreen input, without a companion PC or streaming server. The early handmade prototype is archived in `legacy/native-mock-v001/` and is not part of this release.
 
 > [!IMPORTANT]
 > **This is the genuine YouTube on TV frontend running through Cobalt**, not a recreated or simulated interface.
 
+## Project Status
+
+<p align="center">
+  <a href="#overview"><img src="https://img.shields.io/badge/PLATFORM-PS%20VITA-006fcd?style=for-the-badge&logo=playstation&logoColor=white" alt="Platform"></a>&nbsp;&nbsp;
+  <a href="#how-it-works"><img src="https://img.shields.io/badge/ENGINE-COBALT%20%2B%20STARBOARD-455a64?style=for-the-badge" alt="Engine"></a>&nbsp;&nbsp;
+  <a href="#download"><img src="https://img.shields.io/badge/RELEASE-v0.58%20FULL%20%2B%20LITE-2ea44f?style=for-the-badge" alt="Latest Release"></a>&nbsp;&nbsp;
+  <a href="https://github.com/WolffsRoom/YouTubeOnVita/releases"><img src="https://img.shields.io/github/downloads/WolffsRoom/YouTubeOnVita/total?style=for-the-badge&color=blue&logo=github" alt="Total Downloads"></a>
+</p>
+
+
+<div align="center">
+  <p><em>An independent homebrew project by <a href="https://github.com/WolffsRoom">Wolff's Room</a>.</em></p>
+  <a id="support-this-and-other-projects"></a>
+
+  <em>If you enjoy my work, consider supporting the development!<em>
+  <br>
+[<img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="48">](https://www.buymeacoffee.com/5rsrt7j4z8f)
+</div>
+</div>
+
 ---
 
+<h2 align="center">Table of Contents</h2>
+
 <details open>
-<summary><b>Overview</b></summary>
+<summary><b>Project and Features</b></summary>
 
 - [Overview](#overview)
 - [Download — Full & Lite](#download)
 - [Features](#features)
 - [Controls](#controls)
-- [Cobalt and FPS](#cobalt-and-fps)
+- [Cobalt and  FPS](#cobalt-and-fps)
 - [Native Add-ons](#native-add-ons)
 - [Screenshots](#screenshots)
 
 </details>
 
-<details open>
-<summary><b>Development</b></summary>
+<details>
+<summary><b>Technical and Development</b></summary>
 
 - [How It Works](#how-it-works)
 - [Video and Audio](#video-and-audio)
-- [Google Sign-in and Security](#google-sign-in-and-security)
+- [Google Sign-in and  Security](#google-sign-in-and-security)
 - [Known Limitations](#known-limitations)
-- [Building and Testing](#building-and-testing)
+- [Building and  Testing](#building-and-testing)
 - [Development History](#development-history)
 - [Credits and Disclaimer](#credits-and-disclaimer)
 
 </details>
-
----
-
-## Overview
-
-**YouTubeOnVita** runs the genuine **YouTube on TV** interface on **PlayStation Vita**, powered by Cobalt and Starboard 15. It is **not** a custom recreation.
-
-Browse, search, sign in and watch videos using native buttons and touchscreen input, without a companion PC or streaming server.
-
-The early handmade prototype is archived in `legacy/native-mock-v001/` and is not part of this release.
 
 ---
 
