@@ -44,7 +44,7 @@ _Unofficial client for PS Vita_
   <p><em>An independent homebrew project by <a href="https://github.com/WolffsRoom">Wolff's Room</a>.</em></p>
   <a id="support-this-and-other-projects"></a>
 
-  <em>If you enjoy my work, consider supporting the development!<em>
+  <em>If you enjoy my work, consider supporting the development!</em>
   <br>
 [<img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="48">](https://www.buymeacoffee.com/5rsrt7j4z8f)
 </div>
