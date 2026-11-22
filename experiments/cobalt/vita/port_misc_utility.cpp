@@ -5,10 +5,12 @@
 #include <psp2/kernel/threadmgr.h>
 #include "starboard/string.h"
 #include "starboard/time_zone.h"
+#include "starboard/time.h"
 #include "starboard/system.h"
 #include "starboard/event.h"
 #include "starboard/log.h"
 #include <psp2/net/netctl.h>
+#include <psp2/io/stat.h>
 #include <psp2/apputil.h>
 #include <psp2/system_param.h>
 #include <cstdio>
@@ -22,11 +24,45 @@
 #include <pthread.h>
 
 namespace {
-pthread_once_t netctl_once=PTHREAD_ONCE_INIT;
+pthread_mutex_t netctl_mutex=PTHREAD_MUTEX_INITIALIZER;
 bool netctl_ready=false;
-void initialize_netctl(){
-  int status=sceNetCtlInit();
-  netctl_ready=status>=0; 
+uint64_t netctl_last_attempt=0;
+// Cobalt invokes SbSystemRaisePlatformError from arbitrary threads. Retain
+// its retry callback and invoke it on the main loop only, after connectivity
+// has returned, to avoid re-entering BrowserModule on the network worker.
+pthread_mutex_t platform_error_mu=PTHREAD_MUTEX_INITIALIZER;
+SbSystemPlatformErrorCallback platform_retry=nullptr;
+void* platform_retry_context=nullptr;
+bool platform_error_pending=false;
+volatile unsigned platform_error_generation=0;
+
+bool ensure_netctl(){
+  if(__atomic_load_n(&netctl_ready,__ATOMIC_ACQUIRE))return true;
+  pthread_mutex_lock(&netctl_mutex);
+  if(netctl_ready){
+    pthread_mutex_unlock(&netctl_mutex);
+    return true;
+  }
+  const uint64_t now=(uint64_t)SbTimeGetMonotonicNow();
+  if(netctl_last_attempt && now>=netctl_last_attempt &&
+     now-netctl_last_attempt<2000000ull){
+    pthread_mutex_unlock(&netctl_mutex);
+    return false;
+  }
+  netctl_last_attempt=now?now:1;
+  const int status=sceNetCtlInit();
+  int state=SCE_NETCTL_STATE_DISCONNECTED;
+  // A different Vita module may have initialized NetCtl already, which can
+  // make sceNetCtlInit return an error even though the service is usable.
+  const int check=sceNetCtlInetGetState(&state);
+  const bool available=status>=0 || check>=0;
+  __atomic_store_n(&netctl_ready,available,__ATOMIC_RELEASE);
+  pthread_mutex_unlock(&netctl_mutex);
+  char line[125];
+  snprintf(line,sizeof(line),"YTV_NETWORK_NETCTL_INIT status=0x%x state_query=0x%x ready=%d\n",
+           (unsigned)status,(unsigned)check,(int)available);
+  SbLogRaw(line);
+  return available;
 }
 bool valid_name(const char* tz) {
   if(!tz)return false;
@@ -90,11 +126,51 @@ const char* SbTimeZoneGetName(){
   return names[next];
 }
 bool SbSystemNetworkIsDisconnected(){
-  pthread_once(&netctl_once,initialize_netctl);
-  if(!netctl_ready)return true;
+#if defined(YTV_NATIVE_DOWNLOAD_TEST)
+  // Diagnostic only. Test harness drives explicit disconnected and connected
+  // states independent of the emulator's usually-incomplete SceNetCtl state.
+  SceIoStat forced={};
+  if(sceIoGetstat("ux0:data/youtubevita/test_force_offline.txt",&forced)>=0)
+    return true;
+  if(sceIoGetstat("ux0:data/youtubevita/test_force_online.txt",&forced)>=0)
+    return false;
+#endif
+  if(!ensure_netctl())return true;
   int state=SCE_NETCTL_STATE_DISCONNECTED;
   if(sceNetCtlInetGetState(&state)<0)return true;
   return state!=SCE_NETCTL_STATE_CONNECTED;
+}
+// Native Vita Add-ons overlay polls this state and can retry the Cobalt
+// document load. No cookie/cache deletion is needed when Wi-Fi comes back.
+int ytv_network_platform_error_pending(){
+  pthread_mutex_lock(&platform_error_mu);
+  int result=platform_error_pending?1:0;
+  pthread_mutex_unlock(&platform_error_mu);
+  return result;
+}
+unsigned ytv_network_platform_error_generation(){
+  return __atomic_load_n(&platform_error_generation,__ATOMIC_RELAXED);
+}
+int ytv_network_platform_error_retry(){
+  if(SbSystemNetworkIsDisconnected())return -1;
+  pthread_mutex_lock(&platform_error_mu);
+  SbSystemPlatformErrorCallback callback=platform_retry;
+  void* context=platform_retry_context;
+  platform_retry=nullptr;
+  platform_retry_context=nullptr;
+  platform_error_pending=false;
+  pthread_mutex_unlock(&platform_error_mu);
+  if(callback){
+    SbLogRaw("YTV_NETWORK_NATIVE_RETRY callback=positive\n");
+    callback(kSbSystemPlatformErrorResponsePositive,context);
+    return 1;
+  }
+  // No Cobalt callback exists yet: nudge the TV page via Starboard's
+  // regular network-connected event. Never claim a document reload here.
+  extern void ytv_vita_lifecycle_send(SbEventType type,void* data);
+  ytv_vita_lifecycle_send(kSbEventTypeOsNetworkConnected,nullptr);
+  SbLogRaw("YTV_NETWORK_NATIVE_RETRY callback=none event=online\n");
+  return 0;
 }
 // Network watcher (main thread, about once per second): reports connection
 // changes to Cobalt as kSbEventTypeOsNetworkDisconnected/Connected, which the
@@ -106,7 +182,11 @@ int ytv_vita_network_poll(){
   if(now==last)return 0;
   int previous=last;
   last=now;
-  if(previous<0)return 0;  // first observation: nothing changed yet
+  if(previous<0){
+    SbLogRaw(now?"YTV_LIFECYCLE_NETWORK initial=online\n":
+                 "YTV_LIFECYCLE_NETWORK initial=offline\n");
+    return 0;
+  }
   extern void ytv_vita_lifecycle_send(SbEventType type,void* data);
   char line[80];
   snprintf(line,sizeof(line),"YTV_LIFECYCLE_NETWORK %s\n",now?"connected":"disconnected");
@@ -131,13 +211,26 @@ bool SbSystemSignWithCertificationSecretKey(
 }
 bool SbSystemRaisePlatformError(SbSystemPlatformErrorType type,
    SbSystemPlatformErrorCallback callback,void* context){
-  (void)callback;(void)context;
-  // Cobalt raises kSbSystemPlatformErrorTypeConnectionError ~1 s after a
-  // document load fails (BrowserModule::OnErrorRetry).
-  char line[96];
-  snprintf(line,sizeof(line),"YTV_LIFECYCLE_PLATFORM_ERROR type=%d\n",(int)type);
+  // Before v0.60 this returned false, leaving Cobalt's BrowserModule
+  // retries unhandled. The native overlay now presents an explicit action
+  // and resolves the callback on the main event thread when the user retries.
+  if(type!=kSbSystemPlatformErrorTypeConnectionError)return false;
+  pthread_mutex_lock(&platform_error_mu);
+  if(platform_error_pending){
+    pthread_mutex_unlock(&platform_error_mu);
+    SbLogRaw("YTV_LIFECYCLE_PLATFORM_ERROR duplicate=1\n");
+    return false;
+  }
+  platform_retry=callback;
+  platform_retry_context=context;
+  platform_error_pending=true;
+  __sync_add_and_fetch(&platform_error_generation,1);
+  pthread_mutex_unlock(&platform_error_mu);
+  char line[128];
+  snprintf(line,sizeof(line),"YTV_LIFECYCLE_PLATFORM_ERROR type=%d handler=1 has_callback=%d\n",
+           (int)type,callback?1:0);
   SbLogRaw(line);
-  return false; // native system error UI is not implemented
+  return true;
 }
 // Set by the ELF loader: base address of the official libcobalt.so image.
 uintptr_t ytv_cobalt_image_base=0;

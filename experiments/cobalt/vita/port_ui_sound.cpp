@@ -8,6 +8,19 @@
  *  4 success: 3rdParty_Success_Haptic.mp3
  *  5 failure: 3rdParty_Failure_Haptic.mp3
  *  6 open: navigation_push.mp3
+ *  7 microphone active: jbl_begin.m4a
+ *  8 microphone cancelled: jbl_begin.m4a (requested)
+ *  9 physical touchscreen press: focus_change_small.m4a
+ * 10 download accepted: begin_record.m4a
+ * 11 download completed: WorkoutSaved_Haptic.m4a
+ * 12 controls locked: AutoUnlock_Haptic.m4a
+ * 13 sleep last-minute alert: go_to_sleep_alert.m4a
+ * 14 sleep timer activated: HourlyChime_Haptic.m4a
+ * 15 screen black / 16 text input: lock.m4a
+ * 17 delete text: keyboard_press_delete.m4a
+ * 18 low battery <=15%: Alert_BatteryLow_10p_Haptic.m4a
+ *  3 navigation back: navigation_push.m4a
+ *  6 navigation open: navigation_pop.m4a
  *
  * Converted at build time to compact 48kHz stereo signed PCM in
  * app0:sfx/ui/, removing MP3 album art/decoder overhead and most silence.
@@ -28,20 +41,33 @@
 namespace {
 constexpr int kRate=48000;
 constexpr int kGrain=256;
-constexpr int kKinds=6;
-constexpr int kMaxBytes=192000; // <= 1 second stereo S16
+constexpr int kKinds=18;
+constexpr int kMaxBytes=960000; // <= 5 seconds stereo S16
 const char* kAssets[kKinds]={
  "app0:sfx/ui/focus.pcm",
  "app0:sfx/ui/confirm.pcm",
  "app0:sfx/ui/back.pcm",
  "app0:sfx/ui/success.pcm",
  "app0:sfx/ui/error.pcm",
- "app0:sfx/ui/open.pcm"
+ "app0:sfx/ui/open.pcm",
+ "app0:sfx/ui/mic_on.pcm",
+ "app0:sfx/ui/mic_on.pcm",  // cancel requested same sound
+ "app0:sfx/ui/touch.pcm",
+ "app0:sfx/ui/download_start.pcm",
+ "app0:sfx/ui/download_done.pcm",
+ "app0:sfx/ui/controls_lock.pcm",
+ "app0:sfx/ui/sleep_warning.pcm",
+ "app0:sfx/ui/timer_enable.pcm",
+ "app0:sfx/ui/lock.pcm",
+ "app0:sfx/ui/lock.pcm", // typing requested lock.m4a
+ "app0:sfx/ui/delete.pcm",
+ "app0:sfx/ui/battery_low.pcm"
 };
 int16_t* g_pcm[kKinds]={};
 int g_frames[kKinds]={};
 volatile int g_pending=0;
 volatile int g_enabled=0;
+volatile int g_volume_pct=70;  // persisted via addons.cfg; 0..100
 SceUID g_sema=-1;
 bool g_started=false;
 int load_sound(int k){
@@ -75,14 +101,21 @@ void* run(void*){
   snprintf(msg,sizeof(msg),"YTV_UI_SOUND_PORT rc=0x%x assets=source_pcm\n",(unsigned)port);
   SbLogRaw(msg);
   if(port<0)return nullptr;
-  int vol[2]={SCE_AUDIO_VOLUME_0DB,SCE_AUDIO_VOLUME_0DB};
-  sceAudioOutSetVolume(port,(SceAudioOutChannelFlag)(
-    SCE_AUDIO_VOLUME_FLAG_L_CH|SCE_AUDIO_VOLUME_FLAG_R_CH),vol);
+  int last_volume=-1;
   alignas(16) int16_t block[kGrain*2]={};
   for(;;){
     sceKernelWaitSema(g_sema,1,nullptr);
     int kind=__sync_lock_test_and_set(&g_pending,0);
     if(kind<1||kind>kKinds||!g_enabled)continue;
+    const int pct=__atomic_load_n(&g_volume_pct,__ATOMIC_RELAXED);
+    if(pct==0)continue;
+    if(pct!=last_volume){
+      int v=(int)((int64_t)SCE_AUDIO_VOLUME_0DB*pct/100);
+      int vols[2]={v,v};
+      sceAudioOutSetVolume(port,(SceAudioOutChannelFlag)(
+         SCE_AUDIO_VOLUME_FLAG_L_CH|SCE_AUDIO_VOLUME_FLAG_R_CH),vols);
+      last_volume=pct;
+    }
     const int index=kind-1;
     const int frames=load_sound(index);
     if(!frames){
@@ -140,6 +173,11 @@ void ytv_ui_sound_enable(bool on){
   pthread_detach(thread);
   g_started=true;
   SbLogRaw("YTV_UI_SOUND_INIT ready\n");
+}
+void ytv_ui_sound_set_volume(int pct){
+  if(pct<0)pct=0;
+  if(pct>100)pct=100;
+  __atomic_store_n(&g_volume_pct,pct,__ATOMIC_RELAXED);
 }
 void ytv_ui_sound(int kind){
   if(!g_enabled || g_sema<0 || kind<1 || kind>kKinds)return;

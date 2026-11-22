@@ -70,6 +70,11 @@ extern "C" bool ytv_native_player_present() {
   return __atomic_load_n(&g_ytv_player_instances, __ATOMIC_RELAXED) > 0;
 }
 extern "C" bool ytv_gl_context_is_current();
+extern "C" { extern volatile int g_ytv_video_bilinear_enabled; }
+extern "C" { extern volatile int g_ytv_video_aspect_mode; }
+extern "C" { extern volatile int g_ytv_video_vertical_mode; }  // 0 off, 1 cw, 2 ccw
+extern "C" { extern volatile int g_ytv_media_volume_pct; }
+#include "port_video_crop.h"
 // Exported by SceVideodec but missing from the VitaSDK header.
 extern "C" int sceAvcdecDecodeFlush(SceAvcdecCtrl* decoder);
 // Above 1280x720 pixels SceAvcdec only accepts the non-game entry points
@@ -83,6 +88,9 @@ volatile int g_ytv_hud_video_h = 0;
 volatile unsigned g_ytv_hud_dropped_total = 0;
 volatile bool g_ytv_fhd_decoder_created = false;  // read by the Full HD guard
 extern "C" void ytv_addons_fhd_ok();              // port_addons.cpp
+extern "C" void ytv_addons_fhd_begin();           // port_addons.cpp
+extern "C" void ytv_addons_fhd_end();
+extern "C" void ytv_media_reject_video_size(int width,int height);             // port_addons.cpp
 extern "C" int sceAvcdecQueryDecoderMemSizeNongameapp(SceUInt32 codec,
     const SceAvcdecQueryDecoderInfo* query, SceAvcdecDecoderInfo* info);
 extern "C" int sceAvcdecCreateDecoderNongameapp(SceUInt32 codec, SceAvcdecCtrl* ctrl,
@@ -95,13 +103,24 @@ namespace {
 constexpr int kMaxWidth = 1920;
 constexpr int kMaxHeight = 1088;
 struct Tier { int w, h; };
-constexpr Tier kTiers[] = {{1920, 1088}, {1280, 720}, {864, 480}, {640, 368}, {432, 240}};
+// v0.64: {480, 864} holds portrait Shorts up to 480x854. Without it no tier
+// was tall enough and the player could not be created at all.
+constexpr Tier kTiers[] = {{1920, 1088}, {1280, 720}, {864, 480}, {480, 864},
+                           {640, 368}, {448, 240}};
 // Frames are shown straight from decoder memory (no copy), so the pool also
 // holds the frame on screen and those the GPU may still be reading.
 constexpr int kFramePool = 6;
 constexpr int kGamePixelLimit = 1280 * 720;  // SceAvcdec limit for game apps
 int pool_frames(int cap_w, int cap_h) { return cap_w * cap_h > kGamePixelLimit ? 4 : kFramePool; }
-constexpr uint32_t kGpuFramesInFlight = 2;
+// GXM uses queued display buffers. Two frames were insufficient when native
+// downloads/MP3 encoding delayed the rasterizer: a decoder slot could be
+// reused before a queued draw finished sampling it, causing corrupted pixels.
+// Keep one extra presented-frame margin (still within the six-slot pool).
+constexpr uint32_t kGpuFramesInFlight = 4;  // submitted Vita frames, not decoder jobs
+// This counter advances only after eglSwapBuffers actually submits a frame.
+// vglGetFrameNumber is a renderer-internal counter and must not be used for
+// synchronizing decoder-plane reuse with the display queue.
+extern volatile uint32_t g_swaps;
 constexpr int kVideoQueueTarget = 12;
 constexpr int kAudioQueueTarget = 24;
 constexpr int kAudioGrain = 1024;            // frames per sceAudioOutOutput
@@ -120,6 +139,164 @@ void plog(const char* fmt, ...) {
 }
 
 inline int align16(int v) { return (v + 15) & ~15; }
+// v0.64: output pitch for SceAvcdec. Every stream that decoded on hardware
+// (v0.47-v0.62 logs: 1280, 854->864, 640, 626->640, 960, 568->576, 480, 256,
+// 792->800, 600->608) had a 16-aligned width that is also a multiple of 32;
+// every one refused with UNSUPPORT_IMAGE_SIZE did not (1190->1200, 720x720,
+// 240x426 -> 240). The picture layout now uses a 32-aligned pitch; the
+// visible size still comes from the decoder (horizontalSize/verticalSize).
+inline int align32(int v) { return (v + 31) & ~31; }
+
+// ---- H.264 SPS (v0.64) -----------------------------------------------------
+// Decoders were always created for 5 reference frames. Streams whose SPS asks
+// for a larger decoded picture buffer (non-standard sizes such as 1190x720 or
+// the 240x426 portrait stream in the v0.62 logs) were refused by SceAvcdec with
+// UNSUPPORT_IMAGE_SIZE. The SPS of every key frame is read so the decoder can
+// be recreated with the buffer the stream really needs, and so hardware logs
+// show what the stream asks for.
+struct SpsInfo {
+  int profile, level;
+  int max_refs;          // max_num_ref_frames
+  int dpb;               // VUI max_dec_frame_buffering, or the level's limit
+  bool dpb_from_vui;
+  int coded_w, coded_h;  // macroblock size (multiples of 16)
+  int width, height;     // after cropping
+  bool frame_mbs_only;
+};
+struct BitReader {
+  const uint8_t* d; int n; int pos; bool bad;
+  int bit() {
+    if (pos >= n * 8) { bad = true; return 0; }
+    int b = (d[pos >> 3] >> (7 - (pos & 7))) & 1;
+    pos++;
+    return b;
+  }
+  uint32_t bits(int k) { uint32_t v = 0; while (k-- > 0) v = (v << 1) | (uint32_t)bit(); return v; }
+  uint32_t ue() {
+    int zeros = 0;
+    while (!bit()) { if (bad || ++zeros > 31) { bad = true; return 0; } }
+    return zeros ? ((1u << zeros) - 1 + bits(zeros)) : 0;
+  }
+  int32_t se() { uint32_t v = ue(); return (v & 1) ? (int32_t)((v + 1) / 2) : -(int32_t)(v / 2); }
+};
+void skip_scaling_list(BitReader& b, int size) {
+  int last = 8, next = 8;
+  for (int j = 0; j < size && !b.bad; j++) {
+    if (next) next = (last + b.se() + 256) % 256;
+    last = next ? next : last;
+  }
+}
+void skip_hrd(BitReader& b) {
+  uint32_t cnt = b.ue();
+  b.bits(8);
+  for (uint32_t i = 0; i <= cnt && i < 32 && !b.bad; i++) { b.ue(); b.ue(); b.bit(); }
+  b.bits(20);
+}
+int level_max_dpb_mbs(int level) {
+  switch (level) {
+    case 9: case 10: return 396;
+    case 11: return 900;
+    case 12: case 13: case 20: return 2376;
+    case 21: return 4752;
+    case 22: case 30: return 8100;
+    case 31: return 18000;
+    case 32: return 20480;
+    case 40: case 41: return 32768;
+    case 42: return 34816;
+    case 50: return 110400;
+    default: return level > 50 ? 184320 : 0;
+  }
+}
+bool parse_sps_rbsp(const uint8_t* d, int n, SpsInfo* o) {
+  BitReader b{d, n, 0, false};
+  memset(o, 0, sizeof(*o));
+  o->profile = (int)b.bits(8);
+  b.bits(8);
+  o->level = (int)b.bits(8);
+  b.ue();
+  int chroma = 1;
+  switch (o->profile) {
+    case 100: case 110: case 122: case 244: case 44: case 83: case 86: case 118:
+    case 128: case 138: case 139: case 134: case 135:
+      chroma = (int)b.ue();
+      if (chroma == 3) b.bit();
+      b.ue(); b.ue(); b.bit();
+      if (b.bit()) {
+        for (int i = 0; i < (chroma != 3 ? 8 : 12) && !b.bad; i++)
+          if (b.bit()) skip_scaling_list(b, i < 6 ? 16 : 64);
+      }
+      break;
+    default: break;
+  }
+  b.ue();  // log2_max_frame_num_minus4
+  uint32_t poc = b.ue();
+  if (poc == 0) {
+    b.ue();
+  } else if (poc == 1) {
+    b.bit(); b.se(); b.se();
+    uint32_t c = b.ue();
+    for (uint32_t i = 0; i < c && i < 256 && !b.bad; i++) b.se();
+  }
+  o->max_refs = (int)b.ue();
+  b.bit();
+  int wmbs = (int)b.ue() + 1;
+  int hmap = (int)b.ue() + 1;
+  o->frame_mbs_only = b.bit();
+  if (!o->frame_mbs_only) b.bit();
+  b.bit();
+  int cl = 0, cr = 0, ct = 0, cb = 0;
+  if (b.bit()) { cl = (int)b.ue(); cr = (int)b.ue(); ct = (int)b.ue(); cb = (int)b.ue(); }
+  if (b.bad || wmbs > 512 || hmap > 512) return false;
+  const int hmbs = hmap * (o->frame_mbs_only ? 1 : 2);
+  o->coded_w = wmbs * 16;
+  o->coded_h = hmbs * 16;
+  const int cy = (chroma == 1 ? 2 : 1) * (o->frame_mbs_only ? 1 : 2);
+  o->width = o->coded_w - (chroma ? 2 : 1) * (cl + cr);
+  o->height = o->coded_h - (chroma ? cy : (o->frame_mbs_only ? 1 : 2)) * (ct + cb);
+  int lv = level_max_dpb_mbs(o->level);
+  o->dpb = lv ? std::min(16, lv / (wmbs * hmbs)) : 0;
+  if (b.bit()) {  // vui_parameters_present_flag
+    if (b.bit() && b.bits(8) == 255) b.bits(32);
+    if (b.bit()) b.bit();
+    if (b.bit()) { b.bits(4); if (b.bit()) b.bits(24); }
+    if (b.bit()) { b.ue(); b.ue(); }
+    if (b.bit()) { b.bits(32); b.bits(32); b.bit(); }
+    bool nal = b.bit(); if (nal) skip_hrd(b);
+    bool vcl = b.bit(); if (vcl) skip_hrd(b);
+    if (nal || vcl) b.bit();
+    b.bit();
+    if (b.bit()) {  // bitstream_restriction_flag
+      b.bit(); b.ue(); b.ue(); b.ue(); b.ue();
+      b.ue();  // max_num_reorder_frames
+      uint32_t mdfb = b.ue();
+      if (!b.bad && mdfb <= 16) { o->dpb = (int)mdfb; o->dpb_from_vui = true; }
+    }
+  }
+  return true;
+}
+// Finds an SPS NAL in the first bytes of an Annex B access unit.
+bool find_sps(const uint8_t* d, int n, SpsInfo* o) {
+  const int lim = std::min(n, 512);
+  for (int i = 0; i + 4 < lim; i++) {
+    if (d[i] != 0 || d[i + 1] != 0 || d[i + 2] != 1) continue;
+    if ((d[i + 3] & 0x1F) != 7) continue;
+    uint8_t rbsp[256];
+    int k = 0, zeros = 0;
+    for (int j = i + 4; j < n && k < (int)sizeof(rbsp); j++) {
+      if (zeros >= 2 && d[j] == 3) { zeros = 0; continue; }  // emulation prevention
+      if (zeros >= 2 && d[j] <= 1) break;                     // next start code
+      zeros = d[j] == 0 ? zeros + 1 : 0;
+      rbsp[k++] = d[j];
+    }
+    return parse_sps_rbsp(rbsp, k, o);
+  }
+  return false;
+}
+// Reference frames to ask the decoder for: what the stream may hold, at least
+// the historical 5, at most 16.
+int sps_decoder_refs(const SpsInfo& s) {
+  return std::max(5, std::min(16, std::max(s.max_refs, s.dpb)));
+}
 
 // ---- one-time decoder library initialisation ------------------------------
 pthread_once_t g_libs_once = PTHREAD_ONCE_INIT;
@@ -134,6 +311,8 @@ bool g_lite720_probe_open = false;
 bool g_video_lib = false, g_audio_lib = false;
 int g_lib_pixels = 0;  // largest picture the initialised video library accepts
 bool g_lib_nongame = false;            // library initialised for 1920x1088
+int g_lib_refs = 5;                    // reference frames of the game library
+int g_lib_fhd_refs = 4;                // reference frames of the 1080p library
 volatile bool g_fhd_failed = false;    // the non-game decoder produced no pictures
 
 }  // namespace
@@ -163,13 +342,19 @@ void init_libs() {
   int v = -1;
   // Full HD (Add-ons, experimental): the non-game library accepts 1920x1088.
   if (ytv_addons_cfg_fhd() && !ytv_lowmem()) {
+    // v0.64: 5 reference frames at 1920x1088 is more than H.264 allows at
+    // that size (level 4.1/4.2: 4 frames) and v0.62 hardware logs show
+    // r=0x80620802 (INVALID_PARAM) for it. Try 4 first, then the old 5.
     vinit.horizontal = 1920;
     vinit.vertical = 1088;
-    vinit.numOfRefFrames = 5;
     vinit.numOfStreams = 1;
-    v = sceVideodecInitLibraryNongameapp(SCE_VIDEODEC_TYPE_HW_AVCDEC, &vinit);
-    plog("YTV_LIFECYCLE_PLAYER_VIDEODEC_INIT nongame 1920x1088 r=0x%x\n", (unsigned)v);
-    if (v >= 0) { g_lib_pixels = 1920 * 1088; g_lib_nongame = true; }
+    for (int refs : {4, 5}) {
+      vinit.numOfRefFrames = (uint32_t)refs;
+      v = sceVideodecInitLibraryNongameapp(SCE_VIDEODEC_TYPE_HW_AVCDEC, &vinit);
+      plog("YTV_LIFECYCLE_PLAYER_VIDEODEC_INIT nongame 1920x1088 refs=%d r=0x%x\n", refs,
+           (unsigned)v);
+      if (v >= 0) { g_lib_pixels = 1920 * 1088; g_lib_nongame = true; g_lib_fhd_refs = refs; break; }
+    }
   }
   const Tier lib_sizes[] = {{1280, 720}, {864, 480}};
   for (const Tier& t : lib_sizes) {
@@ -178,10 +363,17 @@ void init_libs() {
     if (ytv_lowmem() && !ytv_lowmem_720() && t.w > 864) continue;
     vinit.horizontal = (uint32_t)t.w;
     vinit.vertical = (uint32_t)t.h;
-    vinit.numOfRefFrames = 5;
     vinit.numOfStreams = 1;
-    v = sceVideodecInitLibrary(SCE_VIDEODEC_TYPE_HW_AVCDEC, &vinit);
-    plog("YTV_LIFECYCLE_PLAYER_VIDEODEC_INIT %dx%d r=0x%x\n", t.w, t.h, (unsigned)v);
+    // v0.64: room for streams that need more than 5 reference frames
+    // (decoders still ask for 5 unless the stream's SPS needs more). 9 is
+    // the H.264 level 4.2 buffer at 1280x720; 5 is the old, proven value.
+    for (int refs : {9, 5}) {
+      vinit.numOfRefFrames = (uint32_t)refs;
+      v = sceVideodecInitLibrary(SCE_VIDEODEC_TYPE_HW_AVCDEC, &vinit);
+      plog("YTV_LIFECYCLE_PLAYER_VIDEODEC_INIT %dx%d refs=%d r=0x%x\n", t.w, t.h, refs,
+           (unsigned)v);
+      if (v >= 0) { g_lib_refs = refs; break; }
+    }
     if (v >= 0) { g_lib_pixels = t.w * t.h; break; }
   }
   g_video_lib = v >= 0;
@@ -224,12 +416,15 @@ struct Frame {
   int width, height;   // displayed size
   int pitch, h16;      // layout of this frame (stream size aligned to 16)
   uint8_t* data;       // Y (pitch*h16) then U, V (pitch/2 * h16/2 each)
+  int cx, cy, cw, ch;  // v0.64: picture shown (aspect mode crop), even values
   uint32_t retired_at; // vitaGL frame number when it left the screen (0: never shown)
 };
 // A released frame can be decoded into again once the GPU is done with it.
 inline bool frame_free(const Frame& f) {
-  return f.data && !f.used && (f.retired_at == 0 ||
-                     vglGetFrameNumber() - f.retired_at >= kGpuFramesInFlight);
+  if (!f.data || f.used) return false;
+  if (f.retired_at == 0) return true;  // never presented to the GPU
+  const uint32_t submitted = __atomic_load_n(&g_swaps,__ATOMIC_ACQUIRE);
+  return (int32_t)(submitted-f.retired_at) >= 0;
 }
 }  // namespace
 
@@ -282,8 +477,14 @@ struct SbPlayerPrivate {
   // sized exactly for the stream, then audio-only playback.
   int size_errors;
   int fhd_errors;
+  bool fhd_guard_active;
+  bool fhd_restart_pending;
+  bool unsupported_size_restart_pending;
   bool size_retry_done;
   bool video_broken;
+  int dec_refs;                 // reference frames the decoder was created for
+  SpsInfo sps;                  // last SPS seen (v0.64)
+  bool sps_valid;
 
   // Audio decode/output.
   int channels, sample_rate;
@@ -385,7 +586,7 @@ void pool_unref(VideoPool* pool) {
 }
 
 // Targets nobody references any more wait here for the GPU: deleted on the
-// GL thread 3 presented frames later (ytv_player_on_swap), or right away
+// GL thread 4 presented frames later (ytv_player_on_swap), or right away
 // after a glFinish (flush_dead_targets).
 SbMutex g_dead_mutex = SB_MUTEX_INITIALIZER;
 struct DeadTarget { SbDecodeTargetPrivate* t; uint32_t due; };
@@ -393,10 +594,22 @@ std::vector<DeadTarget> g_dead;
 volatile uint32_t g_swaps = 0;
 volatile int g_live_targets = 0, g_dead_count = 0;  // diagnostics
 
+// v0.64 Vertical mode: the decode target of the portrait video being
+// watched (a reference is held). The Add-ons overlay draws it rotated over
+// the whole screen. Only players with sound qualify: the muted previews of the
+// home page never take the screen.
+pthread_mutex_t g_vert_lock = PTHREAD_MUTEX_INITIALIZER;
+SbPlayer g_vert_owner = nullptr;
+SbDecodeTargetPrivate* g_vert_target = nullptr;
+int g_vert_w = 0, g_vert_h = 0, g_vert_tw = 0, g_vert_th = 0;
+uint64_t g_vert_us = 0;
+void target_unref(SbDecodeTargetPrivate* t);
+void vertical_publish(SbPlayer p, SbDecodeTargetPrivate* t, int w, int h, int tw, int th);
+void vertical_forget(SbPlayer p);
 void target_unref(SbDecodeTargetPrivate* t) {
   if (!t || __sync_sub_and_fetch(&t->refs, 1) != 0) return;
   SbMutexAcquire(&g_dead_mutex);
-  g_dead.push_back({t, g_swaps + 3});
+  g_dead.push_back({t, g_swaps + 4});
   g_dead_count = (int)g_dead.size();
   SbMutexRelease(&g_dead_mutex);
 }
@@ -437,45 +650,82 @@ void flush_dead_targets(void*) {
 }
 
 SbDecodeTargetPrivate* new_target(VideoPool* pool, int pitch, int h16) {
+  // Creating a new target binds three GL_ALPHA plane textures. The previous
+  // implementation left plane V bound, so upload_current saved the wrong
+  // "previous" binding and leaked it into Cobalt/Skia's texture cache.
+  // Snapshot the caller's binding BEFORE creating or initializing any plane.
+  GLint original_binding = 0;
+  glGetIntegerv(GL_TEXTURE_BINDING_2D,&original_binding);
   SbDecodeTargetPrivate* t = new SbDecodeTargetPrivate();
   t->refs = 1;  // the player's
   __sync_add_and_fetch(&g_live_targets, 1);
   t->pool = pool;
   __sync_add_and_fetch(&pool->refs, 1);
+  const GLint sampler = __atomic_load_n(&g_ytv_video_bilinear_enabled,__ATOMIC_RELAXED)
+                            ? GL_LINEAR : GL_NEAREST;
   glGenTextures(3, t->tex);
+  plog("YTV_LIFECYCLE_VIDEO_FILTER_TARGET mode=%s pitch=%d h16=%d\n",
+       sampler==GL_NEAREST?"nearest":"bilinear",pitch,h16);
   for (int i = 0; i < 3; i++) {
     int w = i == 0 ? pitch : pitch / 2;
     int h = i == 0 ? h16 : h16 / 2;
     glBindTexture(GL_TEXTURE_2D, t->tex[i]);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, w, h, 0, GL_ALPHA, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, sampler);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, sampler);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   }
+  glBindTexture(GL_TEXTURE_2D,(GLuint)original_binding);
+  GLint verified_binding=0;
+  glGetIntegerv(GL_TEXTURE_BINDING_2D,&verified_binding);
+  plog("YTV_LIFECYCLE_VIDEO_TARGET_GL_BINDING_RESTORED before=%d after=%d verified=%d\n",
+       (int)original_binding,(int)verified_binding,
+       (int)(verified_binding==original_binding));
   return t;
 }
 
-bool try_create_decoder(SbPlayer p, int cap_w, int cap_h) {
-  SceAvcdecQueryDecoderInfo query = {(uint32_t)cap_w, (uint32_t)cap_h, 5};
+bool try_create_decoder(SbPlayer p, int cap_w, int cap_h, int refs = 0) {
+  const bool nongame = cap_w * cap_h > kGamePixelLimit;  // a 1080p decoder
+  // v0.64: once the non-game library is initialised (Full HD option) the
+  // game library is not, so EVERY decoder must use the non-game calls, and
+  // none may ask for more reference frames than that library was set up
+  // with. v0.64 hardware log: game-API creates after a successful non-game
+  // init failed with 0x80620002 at every size, so no video played.
+  const bool ng_api = g_lib_nongame;
+  if (refs <= 0) refs = nongame ? g_lib_fhd_refs : 5;
+  if (ng_api && refs > g_lib_fhd_refs) refs = g_lib_fhd_refs;
+  SceAvcdecQueryDecoderInfo query = {(uint32_t)cap_w, (uint32_t)cap_h, (uint32_t)refs};
   SceAvcdecDecoderInfo need;
   memset(&need, 0, sizeof(need));
-  const bool nongame = cap_w * cap_h > kGamePixelLimit;
-  int q = nongame ? sceAvcdecQueryDecoderMemSizeNongameapp(SCE_VIDEODEC_TYPE_HW_AVCDEC, &query, &need)
-                  : sceAvcdecQueryDecoderMemSize(SCE_VIDEODEC_TYPE_HW_AVCDEC, &query, &need);
-  if (q < 0 || need.frameMemSize == 0) return false;
+  if(nongame)ytv_addons_fhd_begin();
+  int q = ng_api ? sceAvcdecQueryDecoderMemSizeNongameapp(SCE_VIDEODEC_TYPE_HW_AVCDEC, &query, &need)
+                 : sceAvcdecQueryDecoderMemSize(SCE_VIDEODEC_TYPE_HW_AVCDEC, &query, &need);
+  if (q < 0 || need.frameMemSize == 0) {
+    if(nongame)ytv_addons_fhd_end();
+    plog("YTV_LIFECYCLE_PLAYER_FHD query=%dx%d refs=%d r=0x%x required=%u\n",
+         cap_w,cap_h,refs,(unsigned)q,(unsigned)need.frameMemSize);
+    return false;
+  }
   void* mem = nullptr;
   p->avc_mem = alloc_device_memory("ytv_avc_ref", need.frameMemSize, &mem);
-  if (p->avc_mem < 0) return false;
+  if (p->avc_mem < 0) {
+    if(nongame)ytv_addons_fhd_end();
+    plog("YTV_LIFECYCLE_PLAYER_FHD ref_alloc_failed required=%u\n",
+         (unsigned)need.frameMemSize);
+    return false;
+  }
   memset(&p->avc, 0, sizeof(p->avc));
   p->avc.frameBuf.pBuf = mem;
   p->avc.frameBuf.size = need.frameMemSize;
-  int r = nongame ? sceAvcdecCreateDecoderNongameapp(SCE_VIDEODEC_TYPE_HW_AVCDEC, &p->avc, &query)
-                  : sceAvcdecCreateDecoder(SCE_VIDEODEC_TYPE_HW_AVCDEC, &p->avc, &query);
+  int r = ng_api ? sceAvcdecCreateDecoderNongameapp(SCE_VIDEODEC_TYPE_HW_AVCDEC, &p->avc, &query)
+                 : sceAvcdecCreateDecoder(SCE_VIDEODEC_TYPE_HW_AVCDEC, &p->avc, &query);
   if (r < 0) {
-    plog("YTV_LIFECYCLE_PLAYER avcdec create %dx%d failed 0x%x\n", cap_w, cap_h, (unsigned)r);
+    plog("YTV_LIFECYCLE_PLAYER avcdec create %dx%d refs=%d api=%s failed 0x%x\n", cap_w, cap_h,
+         refs, ng_api ? "nongame" : "game", (unsigned)r);
     sceKernelFreeMemBlock(p->avc_mem);
     p->avc_mem = -1;
+    if(nongame)ytv_addons_fhd_end();
     return false;
   }
   uint32_t frame_bytes = (uint32_t)(cap_w * cap_h * 3 / 2);
@@ -490,6 +740,9 @@ bool try_create_decoder(SbPlayer p, int cap_w, int cap_h) {
     sceAvcdecDeleteDecoder(&p->avc);
     sceKernelFreeMemBlock(p->avc_mem);
     p->avc_mem = -1;
+    if(nongame)ytv_addons_fhd_end();
+    plog("YTV_LIFECYCLE_PLAYER_FHD mapped_pool_failed required=%u\n",
+         (unsigned)pool_size);
     return false;
   }
   p->frame_mem = pool_mem;
@@ -506,9 +759,14 @@ bool try_create_decoder(SbPlayer p, int cap_w, int cap_h) {
   p->height16 = cap_h;
   p->displayed = -1;
   p->avc_ready = true;
-  if (cap_w * cap_h > kGamePixelLimit) g_ytv_fhd_decoder_created = true;
-  plog("YTV_LIFECYCLE_PLAYER_DECODER capacity=%dx%d ref=%uKiB pool=%uKiB\n", cap_w, cap_h,
-       (unsigned)(need.frameMemSize / 1024), (unsigned)(pool_size / 1024));
+  p->dec_refs = refs;
+  p->fhd_guard_active=nongame;
+  if (nongame) {
+    g_ytv_fhd_decoder_created = true;
+    plog("YTV_LIFECYCLE_PLAYER_FHD decoder_created=1 capacity=%dx%d\n",cap_w,cap_h);
+  }
+  plog("YTV_LIFECYCLE_PLAYER_DECODER capacity=%dx%d refs=%d ref=%uKiB pool=%uKiB\n", cap_w,
+       cap_h, refs, (unsigned)(need.frameMemSize / 1024), (unsigned)(pool_size / 1024));
   return true;
 }
 
@@ -518,7 +776,7 @@ bool try_create_decoder(SbPlayer p, int cap_w, int cap_h) {
 extern "C" bool ytv_player_can_decode_1080p() {
   pthread_once(&g_libs_once, init_libs);
   if (!g_lib_nongame || g_fhd_failed) return false;
-  SceAvcdecQueryDecoderInfo query = {1920, 1088, 5};
+  SceAvcdecQueryDecoderInfo query = {1920, 1088, (uint32_t)g_lib_fhd_refs};
   SceAvcdecDecoderInfo need;
   memset(&need, 0, sizeof(need));
   if (sceAvcdecQueryDecoderMemSizeNongameapp(SCE_VIDEODEC_TYPE_HW_AVCDEC, &query, &need) < 0 ||
@@ -533,15 +791,103 @@ extern "C" bool ytv_player_can_decode_1080p() {
   return avail >= need.frameMemSize + pool + (2u << 20);
 }
 namespace {
+void vertical_publish(SbPlayer p, SbDecodeTargetPrivate* t, int w, int h, int tw, int th) {
+  if (!t) return;
+  SbDecodeTargetPrivate* old = nullptr;
+  pthread_mutex_lock(&g_vert_lock);
+  if (g_vert_target != t) {
+    old = g_vert_target;
+    __sync_add_and_fetch(&t->refs, 1);
+    g_vert_target = t;
+  }
+  g_vert_owner = p;
+  g_vert_w = w; g_vert_h = h; g_vert_tw = tw; g_vert_th = th;
+  g_vert_us = sceKernelGetSystemTimeWide();
+  pthread_mutex_unlock(&g_vert_lock);
+  if (old) target_unref(old);
+}
+void vertical_forget(SbPlayer p) {
+  SbDecodeTargetPrivate* old = nullptr;
+  pthread_mutex_lock(&g_vert_lock);
+  if (g_vert_owner == p) {
+    old = g_vert_target;
+    g_vert_target = nullptr;
+    g_vert_owner = nullptr;
+  }
+  pthread_mutex_unlock(&g_vert_lock);
+  if (old) target_unref(old);
+}
+// Renderer thread (Add-ons overlay): the portrait frame to draw, with a
+// reference the caller gives back through ytv_player_vertical_release().
+// w/h: visible picture; tw/th: texture (plane 0) size.
+extern "C" void* ytv_player_vertical_acquire(unsigned tex[3], int* w, int* h, int* tw, int* th) {
+  void* r = nullptr;
+  pthread_mutex_lock(&g_vert_lock);
+  SbDecodeTargetPrivate* t = g_vert_target;
+  SbPlayer p = g_vert_owner;
+  // A paused Short keeps its picture; a player that stopped presenting for
+  // 2 s (left the page, a muted preview took over) gives the screen back.
+  if (t && p && p->volume > 0.01 && sceKernelGetSystemTimeWide() - g_vert_us < 2000000ull) {
+    __sync_add_and_fetch(&t->refs, 1);
+    for (int i = 0; i < 3; i++) tex[i] = t->tex[i];
+    *w = g_vert_w; *h = g_vert_h; *tw = g_vert_tw; *th = g_vert_th;
+    r = t;
+  }
+  pthread_mutex_unlock(&g_vert_lock);
+  return r;
+}
+extern "C" void ytv_player_vertical_release(void* t) {
+  if (t) target_unref(static_cast<SbDecodeTargetPrivate*>(t));
+}
+// Media policy: whether a portrait decoder (480x864, Shorts up to 480x854)
+// is accepted by SceAvcdec. Queried once.
+extern "C" bool ytv_player_can_decode_portrait() {
+  pthread_once(&g_libs_once, init_libs);
+  static int cached = -1;
+  if (cached < 0) {
+    SceAvcdecQueryDecoderInfo query = {480, 864, (uint32_t)(g_lib_nongame ? g_lib_fhd_refs : 5)};
+    SceAvcdecDecoderInfo need;
+    memset(&need, 0, sizeof(need));
+    int q = !g_video_lib ? -1
+            : g_lib_nongame ? sceAvcdecQueryDecoderMemSizeNongameapp(SCE_VIDEODEC_TYPE_HW_AVCDEC, &query, &need)
+                            : sceAvcdecQueryDecoderMemSize(SCE_VIDEODEC_TYPE_HW_AVCDEC, &query, &need);
+    cached = q >= 0 && need.frameMemSize > 0;
+    plog("YTV_LIFECYCLE_PLAYER_PORTRAIT query=480x864 r=0x%x ok=%d\n", (unsigned)q, cached);
+  }
+  return cached == 1;
+}
 // Largest tier that fits in memory and holds the stream.
 bool create_video_decoder(SbPlayer p, int need_w, int need_h) {
   log_free_memory("before_decoder");
+  const bool needs_fhd=(int64_t)need_w*need_h>kGamePixelLimit;
+  // Critical v0.60 fix: with the Full HD option enabled, the old loop
+  // attempted 1920x1088 for EVERY video, even 360p. Only try the nongame
+  // decoder for actual >720p streams; preserve the regular decoder for
+  // lower resolutions, both in Full and Lite.
+  // YouTube Music's square album-art/lyrics player typically emits 480x480
+  // H.264. A 1280x720 decoder reserves ~23 MiB for that static picture and
+  // competes with MP3 transcoding. Give this shape a compact 864x480 decoder
+  // first; preserve the legacy large capacity for regular adaptive videos.
+  if(!needs_fhd && need_w<=480 && need_h<=480 && need_h>=400 &&
+     g_lib_pixels>=864*480){
+    if(try_create_decoder(p,864,480)){
+      plog("YTV_LIFECYCLE_PLAYER_LYRICS_COMPACT %dx%d cap=864x480\n",
+           need_w,need_h);
+      return true;
+    }
+  }
   for (const Tier& t : kTiers) {
     if (t.w < need_w || t.h < need_h) continue;
-    // 1080p decoders only with the Full HD option (non-game library ready).
-    if (t.w * t.h > kGamePixelLimit && (!g_lib_nongame || g_fhd_failed)) continue;
-    if (t.w * t.h <= kGamePixelLimit && t.w * t.h > g_lib_pixels) continue;
+    const bool tier_fhd=t.w*t.h>kGamePixelLimit;
+    if (tier_fhd && !needs_fhd)continue;
+    if (tier_fhd && (!g_lib_nongame || g_fhd_failed))continue;
+    if (!tier_fhd && t.w*t.h>g_lib_pixels && !g_lib_nongame)continue;
     if (try_create_decoder(p, t.w, t.h)) return true;
+    if(tier_fhd){
+      g_fhd_failed=true;
+      plog("YTV_LIFECYCLE_PLAYER_FHD decoder_creation_failed cap=%dx%d downgrade=720p\n",
+           t.w,t.h);
+    }
   }
   return false;
 }
@@ -549,6 +895,10 @@ bool create_video_decoder(SbPlayer p, int need_w, int need_h) {
 void destroy_video_decoder(SbPlayer p) {
   if (p->avc_ready) sceAvcdecDeleteDecoder(&p->avc);
   p->avc_ready = false;
+  if(p->fhd_guard_active){
+    p->fhd_guard_active=false;
+    ytv_addons_fhd_end();
+  }
   if (p->avc_mem >= 0) sceKernelFreeMemBlock(p->avc_mem);
   p->avc_mem = -1;
 }
@@ -563,11 +913,29 @@ bool decode_video_sample(SbPlayer p, const Sample& s) {
   Frame& f = p->frames[slot];
   // Output layout follows the stream's current size (YouTube switches
   // resolution inside one player); the slot holds up to the decoder capacity.
-  int lw = align16(s.width > 0 ? s.width : p->stream_width);
-  int lh = align16(s.height > 0 ? s.height : p->stream_height);
+  const int stream_w=s.width>0?s.width:p->stream_width;
+  const int stream_h=s.height>0?s.height:p->stream_height;
+  const bool wide720=stream_w==1190 && stream_h==720;
+  // Experimental hardware workaround: use the known-valid 1280x720
+  // output surface for 1190x720 instead of rejected 1200x720 layout.
+  // This is padding only; the compressed H.264 is not transcoded.
+  int lw = wide720?1280:align32(stream_w);
+  int lh = align16(stream_h);
   if (lw > p->pitch || lh > p->height16) {
     plog("YTV_PLAYER frame %dx%d above capacity %dx%d\n", lw, lh, p->pitch, p->height16);
     return true;  // consumed; cannot be shown with this decoder
+  }
+  {
+    SpsInfo sps;
+    if (find_sps(static_cast<const uint8_t*>(s.buffer), s.size, &sps)) {
+      if (!p->sps_valid || memcmp(&sps, &p->sps, sizeof(sps)) != 0)
+        plog("YTV_LIFECYCLE_PLAYER_SPS profile=%d level=%d refs=%d dpb=%d%s size=%dx%d "
+             "coded=%dx%d progressive=%d decoder_refs=%d\n", sps.profile, sps.level,
+             sps.max_refs, sps.dpb, sps.dpb_from_vui ? "(vui)" : "(level)", sps.width,
+             sps.height, sps.coded_w, sps.coded_h, (int)sps.frame_mbs_only, p->dec_refs);
+      p->sps = sps;
+      p->sps_valid = true;
+    }
   }
   SceAvcdecAu au;
   memset(&au, 0, sizeof(au));
@@ -585,6 +953,12 @@ bool decode_video_sample(SbPlayer p, const Sample& s) {
   pic.frame.frameHeight = (uint32_t)lh;
   pic.frame.pPicture[0] = f.data;
   pic.frame.pPicture[1] = f.data + (size_t)lw * lh;
+  if(wide720){
+    static bool logged=false;
+    if(!logged){logged=true;
+      plog("YTV_LIFECYCLE_PLAYER_PADDED_1190 output=1280x720 stream=1190x720\n");
+    }
+  }
   SceAvcdecPicture* pics[1] = {&pic};
   SceAvcdecArrayPicture array;
   memset(&array, 0, sizeof(array));
@@ -601,27 +975,46 @@ bool decode_video_sample(SbPlayer p, const Sample& s) {
            (unsigned)r, s.size, lw, lh, p->stream_width, p->stream_height);
     if (p->pitch * p->height16 > kGamePixelLimit && p->total_frames == 0 && ++p->fhd_errors >= 5 &&
         !g_fhd_failed) {
-      g_fhd_failed = true;  // CanPlay stops offering 1080p; this player goes audio-only
+      g_fhd_failed = true;  // CanPlay must reject 1080p for this run.
       p->video_broken = true;
-      plog("YTV_LIFECYCLE_PLAYER fhd decoder failed (0x%x): Full HD disabled for this run\n",
+      // Notify Cobalt OUTSIDE p->mutex so the player can be replaced at
+      // 720p; merely switching to audio-only leaves a broken video forever.
+      p->fhd_restart_pending=true;
+      plog("YTV_LIFECYCLE_PLAYER_FHD decode_failed=0x%x restart_at_720p=1\n",
            (unsigned)r);
     }
     if ((unsigned)r == (unsigned)SCE_AVCDEC_ERROR_UNSUPPORT_IMAGE_SIZE && ++p->size_errors >= 3) {
       p->size_errors = 0;
       bool retried = false;
-      if (!p->size_retry_done && (lw != p->pitch || lh != p->height16)) {
-        // Decoder with the stream's exact (16-aligned) size.
+      const int old_refs = p->dec_refs;
+      const int want_refs = p->sps_valid ? sps_decoder_refs(p->sps) : old_refs;
+      const bool more_refs = want_refs > old_refs;
+      if (!p->size_retry_done && (more_refs || lw != p->pitch || lh != p->height16)) {
+        // Decoder with the stream's exact (16-aligned) size and, since v0.64,
+        // the reference frames its SPS asks for. A smaller capacity keeps the
+        // memory of the larger buffer close to what the old decoder used.
         p->size_retry_done = true;
         destroy_video_decoder(p);
         pool_unref(p->pool);  // nothing decoded from it is on screen yet
         p->pool = nullptr;
         p->pending_pts.clear();
-        retried = try_create_decoder(p, lw, lh);
-        plog("YTV_LIFECYCLE_PLAYER size_retry capacity=%dx%d ok=%d\n", lw, lh, (int)retried);
+        if (more_refs) {
+          retried = try_create_decoder(p, lw, lh, want_refs);
+          plog("YTV_LIFECYCLE_PLAYER size_retry capacity=%dx%d refs=%d ok=%d\n", lw, lh,
+               want_refs, (int)retried);
+        }
+        if (!retried) {
+          retried = try_create_decoder(p, lw, lh);
+          plog("YTV_LIFECYCLE_PLAYER size_retry capacity=%dx%d refs=%d ok=%d\n", lw, lh,
+               p->dec_refs, (int)retried);
+        }
       }
       if (!retried) {
         p->video_broken = true;
-        plog("YTV_LIFECYCLE_PLAYER video %dx%d unsupported by the decoder: audio only\n", lw, lh);
+        ytv_media_reject_video_size(stream_w,stream_h);
+        p->unsupported_size_restart_pending=true;
+        plog("YTV_LIFECYCLE_PLAYER_UNSUPPORTED_SIZE %dx%d capability_refresh=1\n",
+             p->stream_width,p->stream_height);
       }
     }
     return true;  // sample consumed; the stream may recover at the next key frame
@@ -648,6 +1041,29 @@ bool decode_video_sample(SbPlayer p, const Sample& s) {
     f.height = pic.frame.verticalSize ? (int)pic.frame.verticalSize : lh;
     if (f.width > lw) f.width = lw;
     if (f.height > lh) f.height = lh;
+    // v0.64: the aspect-mode crop (and the 1190x720 padding) is applied by
+    // the GPU through the decode target's content region. The previous CPU
+    // compaction moved ~1.3 MB of mapped decoder memory per frame and caused
+    // dropped frames on hardware (1190x720 streams, Zoom/Stretch modes).
+    const int mode=__atomic_load_n(&g_ytv_video_aspect_mode,__ATOMIC_RELAXED);
+    f.cx=0; f.cy=0; f.cw=f.width&~1; f.ch=f.height&~1;
+    if(wide720 || mode!=0){
+      const int vw=std::min(f.width,stream_w);
+      const int vh=std::min(f.height,stream_h);
+      const YtvCropRect crop=ytv_aspect_region(vw,vh,mode);
+      if(crop.w>0 && crop.h>0){
+        f.cx=crop.x; f.cy=crop.y; f.cw=crop.w; f.ch=crop.h;
+        f.width=vw;
+        f.height=vh;
+        static int last_mode=-1,last_w=0,last_h=0;
+        if(last_mode!=mode || last_w!=crop.w || last_h!=crop.h){
+          last_mode=mode;last_w=crop.w;last_h=crop.h;
+          plog("YTV_LIFECYCLE_VIDEO_ASPECT_FRAME mode=%s source=%dx%d crop=%dx%d xy=%d,%d\n",
+             mode==1?"zoom":mode==2?"stretch":"original",
+             vw,vh,crop.w,crop.h,crop.x,crop.y);
+        }
+      }
+    }
     f.used = true;
     p->total_frames++;
     g_ytv_hud_video_h = f.height;
@@ -818,7 +1234,7 @@ int audio_output_thread(SceSize, void* argp) {
         stretch->Push(tmp, chunk);
         pulled += chunk;
       }
-      int volume = (int)(p->volume * SCE_AUDIO_VOLUME_0DB);
+      int volume = (int)(p->volume * SCE_AUDIO_VOLUME_0DB * __atomic_load_n(&g_ytv_media_volume_pct,__ATOMIC_RELAXED)/100.0);
       SbMutexRelease(&p->mutex);
       if (volume != last_volume) {
         int v[2] = {volume, volume};
@@ -860,7 +1276,7 @@ int audio_output_thread(SceSize, void* argp) {
       p->ring_read = (p->ring_read + take) % kPcmRingFrames;
       p->ring_count -= take;
     }
-    int volume = (int)(p->volume * SCE_AUDIO_VOLUME_0DB);
+    int volume = (int)(p->volume * SCE_AUDIO_VOLUME_0DB * __atomic_load_n(&g_ytv_media_volume_pct,__ATOMIC_RELAXED)/100.0);
     SbMutexRelease(&p->mutex);
     if (volume != last_volume) {
       int v[2] = {volume, volume};
@@ -1051,9 +1467,23 @@ void* worker_main(void* arg) {
     if (!did_work && !ask_video && !ask_audio && !start_presenting && !report_eos) {
       SbConditionVariableWaitTimed(&p->cond, &p->mutex, 5000);
     }
+    const bool fhd_restart=p->fhd_restart_pending;
+    const bool size_restart=p->unsupported_size_restart_pending;
+    p->fhd_restart_pending=false;
+    p->unsupported_size_restart_pending=false;
     SbMutexRelease(&p->mutex);
 
     for (auto b : to_free) free_sample(p, b);
+    if(fhd_restart && p->player_error){
+      plog("YTV_LIFECYCLE_PLAYER_FHD notifying_capability_changed\n");
+      p->player_error(p,p->context,kSbPlayerErrorCapabilityChanged,
+          "1080p decoder failed: retrying a supported resolution");
+    }
+    if(size_restart && p->player_error){
+      plog("YTV_LIFECYCLE_PLAYER_UNSUPPORTED_SIZE notifying_capability_changed\n");
+      p->player_error(p,p->context,kSbPlayerErrorCapabilityChanged,
+          "H.264 decoder rejected picture dimensions: reselect lower resolution");
+    }
     if (start_presenting) report_state(p, kSbPlayerStatePresenting, ticket);
     if (report_eos) report_state(p, kSbPlayerStateEndOfStream, ticket);
     if (ask_video) need_data(p, kSbMediaTypeVideo, ticket);
@@ -1080,16 +1510,24 @@ void upload_current(void* arg) {
       if (best < 0 || f.pts > p->frames[best].pts) best = i;
     }
   }
+  // v0.60: video filtering is selected when a NEW decode target is created.
+  // Do not mutate Skia/Cobalt-managed GL texture state during playback:
+  // the previous runtime sampler toggle was followed by a hardware crash.
   if (best >= 0 && p->frames[best].pts != p->uploaded_pts) {
     Frame& f = p->frames[best];
-    if (!p->cur || p->tex_pitch != p->pitch || p->tex_height != p->height16) {
+    // The textures always cover the decoder layout (pitch x h16); the crop
+    // is a content region (v0.64).
+    const int target_pitch=p->pitch;
+    const int target_h=p->height16;
+    if (!p->cur || p->cur->pool!=p->pool ||
+        p->tex_pitch!=target_pitch || p->tex_height!=target_h) {
       // New size: new textures in a new target. Images Cobalt still holds
       // keep the old one (and its texture ids) until they are released.
       SbDecodeTargetPrivate* old = p->cur;
-      p->cur = new_target(p->pool, p->pitch, p->height16);
+      p->cur = new_target(p->pool,target_pitch,target_h);
       target_unref(old);
-      p->tex_pitch = p->pitch;
-      p->tex_height = p->height16;
+      p->tex_pitch=target_pitch;
+      p->tex_height=target_h;
     }
     const uint8_t* y = f.data;
     const uint8_t* u = y + (size_t)f.pitch * f.h16;
@@ -1123,7 +1561,10 @@ void upload_current(void* arg) {
     // The previous frame leaves the screen; the GPU may read it for a while.
     if (p->displayed >= 0 && p->displayed != best) {
       p->frames[p->displayed].used = false;
-      p->frames[p->displayed].retired_at = vglGetFrameNumber();
+      // The GPU may still have multiple queued draws referring to this
+      // decoder slot. Defer reuse until 4 REAL buffer submissions occurred.
+      p->frames[p->displayed].retired_at =
+          __atomic_load_n(&g_swaps,__ATOMIC_ACQUIRE)+kGpuFramesInFlight;
     }
     p->displayed = best;
     p->shown_frames++;
@@ -1133,25 +1574,29 @@ void upload_current(void* arg) {
     memset(&info, 0, sizeof(info));
     info.format = kSbDecodeTargetFormat3PlaneYUVI420;
     info.is_opaque = true;
-    info.width = f.width;
-    info.height = f.height;
+    info.width = f.cw;
+    info.height = f.ch;
     for (int i = 0; i < 3; i++) {
       SbDecodeTargetInfoPlane& pl = info.planes[i];
       pl.texture = p->cur->tex[i];
       pl.gl_texture_target = GL_TEXTURE_2D;
       pl.gl_texture_format = GL_ALPHA;
-      // The content region must cover the whole texture: with a sub-region
-      // (e.g. 854 of a 864 pitch) Cobalt's region transform assumes a
-      // bottom-up origin and the video showed upside down. The macroblock
-      // padding (<= 15 px of edge content) is therefore shown, scaled.
-      pl.width = i == 0 ? f.pitch : f.pitch / 2;
-      pl.height = i == 0 ? f.h16 : f.h16 / 2;
-      pl.content_region.left = 0;
-      pl.content_region.top = 0;
-      pl.content_region.right = pl.width;
-      pl.content_region.bottom = pl.height;
+      // Cobalt treats texture rows as bottom-up. Without a content region it
+      // flips the image itself with a negative-height rect (hardware_
+      // rasterizer.cc: y = H, height = -H). A region must do the same, or
+      // the video shows upside down (v0.3x note, v0.64 Vita3K 4:3 Zoom test):
+      // rows [cy, cy+ch) are given as top = H - cy > bottom = H - (cy+ch).
+      const int div = i == 0 ? 1 : 2;
+      pl.width = f.pitch / div;
+      pl.height = f.h16 / div;
+      pl.content_region.left = f.cx / div;
+      pl.content_region.right = (f.cx + f.cw) / div;
+      pl.content_region.top = (f.h16 - f.cy) / div;
+      pl.content_region.bottom = (f.h16 - (f.cy + f.ch)) / div;
     }
     p->have_target = true;
+    if (info.height > info.width && p->volume > 0.01)
+      vertical_publish(p, p->cur, f.width, f.height, f.pitch, f.h16);
   }
   // Frames older than the one now on screen will never be shown.
   if (best >= 0) {
@@ -1252,7 +1697,13 @@ SbPlayer SbPlayerCreate(SbWindow window, const SbPlayerCreationParam* param,
     p->stream_width = w;
     p->stream_height = h;
     if (align16(w) > kMaxWidth || align16(h) > kMaxHeight) ok = false;
-    if (ok) ok = create_video_decoder(p, align16(w), align16(h));
+    if (ok) ok = create_video_decoder(p,(w==1190 && h==720)?1280:align32(w),align16(h));
+    if (!ok) {
+      // v0.64: no decoder for this size (e.g. a portrait size the hardware
+      // refuses). Stop advertising it so the next attempt picks another one.
+      ytv_media_reject_video_size(w, h);
+      plog("YTV_LIFECYCLE_PLAYER decoder_unavailable %dx%d rejected=1\n", w, h);
+    }
   }
   if (ok && has_audio) {
     ok = parse_audio_config(p, param->audio_stream_info) && create_audio_decoder(p);
@@ -1301,6 +1752,7 @@ SbPlayer SbPlayerCreate(SbWindow window, const SbPlayerCreationParam* param,
 
 void SbPlayerDestroy(SbPlayer p) {
   if (!p) return;
+  vertical_forget(p);
   plog("YTV_PLAYER_DESTROY_BEGIN id=%u dims=%dx%d pending=%d live=%d\n",
        p->serial, p->stream_width, p->stream_height, (int)g_dead_count,
        (int)g_live_targets);
@@ -1444,8 +1896,9 @@ void SbPlayerGetInfo(SbPlayer p, SbPlayerInfo* out) {
   memset(out, 0, sizeof(*out));
   out->current_media_timestamp = media_time_locked(p);
   out->duration = SB_PLAYER_NO_DURATION;
-  out->frame_width = p->stream_width;
-  out->frame_height = p->stream_height;
+  const int aspect=__atomic_load_n(&g_ytv_video_aspect_mode,__ATOMIC_RELAXED);
+  out->frame_width = (p->has_video && aspect!=0)?960:p->stream_width;
+  out->frame_height = (p->has_video && aspect!=0)?544:p->stream_height;
   out->is_paused = p->rate == 0.0;
   out->volume = p->volume;
   out->total_video_frames = p->total_frames;

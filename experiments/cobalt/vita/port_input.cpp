@@ -31,7 +31,26 @@ extern "C" SbWindow ytv_vita_current_window();
 extern "C" bool ytv_addons_input(uint32_t previous, uint32_t current);
 extern "C" bool ytv_addons_menu_open();
 extern "C" void ytv_addons_toggle();
+extern "C" void ytv_addons_adjust_media(int volume_delta,int brightness_delta);
+extern "C" bool ytv_native_player_present();
 extern "C" void ytv_addons_tap(float x, float y);
+// v0.64 Shorts in Vertical mode (port_addons.cpp): 0 when not on screen.
+extern "C" int ytv_addons_vertical_dir();
+extern "C" { extern volatile int g_ytv_screen_flip; }  // port_addons.cpp
+// Inverted screen (Vita held upside down): physical directions, sticks,
+// L/R and the touch panel are turned 180 degrees with the picture.
+static inline bool screen_flipped() { return __atomic_load_n(&g_ytv_screen_flip, __ATOMIC_RELAXED) != 0; }
+static uint32_t flip_buttons(uint32_t b) {
+  uint32_t r = b & ~(uint32_t)(SCE_CTRL_UP | SCE_CTRL_DOWN | SCE_CTRL_LEFT | SCE_CTRL_RIGHT |
+                               SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER);
+  if (b & SCE_CTRL_UP) r |= SCE_CTRL_DOWN;
+  if (b & SCE_CTRL_DOWN) r |= SCE_CTRL_UP;
+  if (b & SCE_CTRL_LEFT) r |= SCE_CTRL_RIGHT;
+  if (b & SCE_CTRL_RIGHT) r |= SCE_CTRL_LEFT;
+  if (b & SCE_CTRL_LTRIGGER) r |= SCE_CTRL_RTRIGGER;
+  if (b & SCE_CTRL_RTRIGGER) r |= SCE_CTRL_LTRIGGER;
+  return r;
+}
 extern "C" uint32_t ytv_addons_hidden_buttons();
 extern "C" void ytv_ui_sound(int kind);  // port_ui_sound.cpp
 extern "C" void ytv_vita_lifecycle_send(SbEventType type, void* data);
@@ -49,6 +68,33 @@ int g_script_count = 0, g_script_next = 0;
 bool g_script_loaded = false;
 uint64_t g_start_us = 0;
 uint32_t g_previous = 0;
+// Strong initial threshold, lower release threshold prevents drift chatter.
+struct StickRepeat { uint32_t direction=0; uint64_t next=0; };
+StickRepeat g_left_stick,g_right_stick;
+uint32_t g_analog_pulse=0;
+uint64_t g_analog_release=0;
+uint32_t g_shortcut_previous=0;
+uint32_t stick_direction(int x,int y,uint32_t old){
+  const int dx=x-128,dy=y-128;
+  const int ax=dx<0?-dx:dx,ay=dy<0?-dy:dy;
+  const int threshold=old?42:58;
+  if(ax<threshold && ay<threshold)return 0;
+  return ax>=ay?(dx<0?SCE_CTRL_LEFT:SCE_CTRL_RIGHT):
+                 (dy<0?SCE_CTRL_UP:SCE_CTRL_DOWN);
+}
+uint32_t stick_step(StickRepeat& state,int x,int y,uint64_t now){
+  uint32_t direction=stick_direction(x,y,state.direction);
+  if(direction!=state.direction){
+    state.direction=direction;
+    state.next=now+350000;
+    return direction;
+  }
+  if(direction && now>=state.next){
+    state.next=now+145000;
+    return direction;
+  }
+  return 0;
+}
 uint32_t g_script_held = 0;
 uint64_t g_script_release_us = 0;
 // Front touch panel state (one tracked finger plus finger count).
@@ -61,6 +107,10 @@ bool g_swiped = false;                   // this touch produced D-pad steps
 int g_max_fingers = 0;
 constexpr float kTapSlop = 12.f;         // window pixels (~ finger jitter)
 constexpr float kSwipeStep = 72.f;       // window pixels per D-pad step
+// Vertical mode (Shorts): one flick of this length = next / previous video.
+constexpr float kShortsSwipe = 90.f;
+int g_shorts_dir = 0;          // vertical rotation when this touch began
+bool g_shorts_flicked = false;  // this touch already changed the video
 // Gesture-generated button presses, delivered one at a time.
 uint32_t g_gesture_queue[16];
 int g_gq_head = 0, g_gq_count = 0;
@@ -108,7 +158,11 @@ uint32_t button_by_name(const char* n) {
     {"circle", SCE_CTRL_CIRCLE}, {"square", SCE_CTRL_SQUARE},
     {"triangle", SCE_CTRL_TRIANGLE}, {"l", SCE_CTRL_LTRIGGER},
     {"r", SCE_CTRL_RTRIGGER}, {"start", SCE_CTRL_START},
-    {"select", SCE_CTRL_SELECT}};
+    {"select", SCE_CTRL_SELECT},
+    {"stick_l_left",0x80000001u},{"stick_l_right",0x80000002u},
+    {"stick_l_up",0x80000003u},{"stick_l_down",0x80000004u},
+    {"stick_r_left",0x80000005u},{"stick_r_right",0x80000006u},
+    {"stick_r_up",0x80000007u},{"stick_r_down",0x80000008u}};
   for (auto& e : t) if (strcmp(n, e.name) == 0) return e.bit;
   return 0;
 }
@@ -254,6 +308,7 @@ void pump_touch(SbWindow window, uint64_t now) {
     id = t.report[pick].id;
     x = t.report[pick].x * 0.5f;
     y = t.report[pick].y * 0.5f;
+    if (screen_flipped()) { x = 959.f - x; y = 543.f - y; }
   }
   // Diagnostic scripted tap / swipe behave like one finger.
   if (g_tap_active) {
@@ -280,13 +335,31 @@ void pump_touch(SbWindow window, uint64_t now) {
   if (finger && !g_touch_down) {
     g_press_x = g_anchor_x = x; g_press_y = g_anchor_y = y;
     g_swiped = false;
-    g_scrub_touch = y > kScrubZoneY && (video_playing(now) || g_seek_commit_us);
+    g_shorts_dir = ytv_addons_vertical_dir();
+    g_shorts_flicked = false;
+    g_scrub_touch = !g_shorts_dir && y > kScrubZoneY && (video_playing(now) || g_seek_commit_us);
     g_max_fingers = fingers;
   } else if (finger && g_touch_down) {
     if (fingers > g_max_fingers) g_max_fingers = fingers;
     float dx = x - g_anchor_x, dy = y - g_anchor_y;
     float ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
-    if (g_max_fingers == 1 && g_scrub_touch && ax >= kScrubStep && ax >= ay * 0.7f) {
+    if (g_shorts_dir) {
+      // Shorts held upright (Vertical mode): like a phone, a flick up shows
+      // the next video, a flick down the previous one (YouTube TV's Shorts
+      // player: D-pad down / up). "Up" for the viewer is screen right when
+      // the picture is turned clockwise, screen left when counter-clockwise.
+      const float up = g_shorts_dir == 1 ? dx : -dx;
+      const float side = dy < 0 ? -dy : dy;
+      const float aup = up < 0 ? -up : up;
+      if (g_max_fingers == 1 && !g_shorts_flicked && aup >= kShortsSwipe && aup >= side) {
+        gesture_push(up > 0 ? SCE_CTRL_DOWN : SCE_CTRL_UP);
+        g_shorts_flicked = true;
+        g_swiped = true;
+        char msg[80];
+        snprintf(msg, sizeof(msg), "YTV_SHORTS_SWIPE %s\n", up > 0 ? "next" : "previous");
+        SbLogRaw(msg);
+      }
+    } else if (g_max_fingers == 1 && g_scrub_touch && ax >= kScrubStep && ax >= ay * 0.7f) {
       // Scrub: finger right = forward (like dragging the bar's handle).
       gesture_push(dx > 0 ? SCE_CTRL_RIGHT : SCE_CTRL_LEFT);
       g_anchor_x += dx > 0 ? kScrubStep : -kScrubStep;
@@ -311,10 +384,18 @@ void pump_touch(SbWindow window, uint64_t now) {
     if (!g_swiped && g_max_fingers >= 3) {
       ytv_addons_toggle();  // three-finger tap: add-on menu
     } else if (!g_swiped && g_max_fingers >= 2) {
+      ytv_ui_sound(3);  // native navigation back (touch gesture)
       gesture_push(SCE_CTRL_CIRCLE);  // Back
     } else if (tap && ytv_addons_menu_open()) {
+      ytv_ui_sound(9); // short touch cue, one per finished tap
       ytv_addons_tap(g_press_x, g_press_y);
+    } else if (tap && g_shorts_dir) {
+      // Vertical mode hides YouTube's page, so a tap must not click on it:
+      // it plays / pauses the Short (OK button).
+      ytv_ui_sound(9);
+      gesture_push(SCE_CTRL_CROSS);
     } else if (tap) {
+      ytv_ui_sound(9); // do not play repeatedly during a swipe
       // A tap: pointer click where the finger went down (or a double tap).
       handle_tap(window, now, g_press_x, g_press_y);
     }
@@ -345,8 +426,14 @@ extern "C" int ytv_vita_input_pump() {
   if (!g_script_loaded) load_script();
   SceCtrlData pad;
   memset(&pad, 0, sizeof(pad));
+  pad.lx=pad.ly=pad.rx=pad.ry=128;
   uint32_t current = 0;
   if (sceCtrlPeekBufferPositive(0, &pad, 1) > 0) current = pad.buttons;
+  if (screen_flipped()) {
+    current = flip_buttons(current);
+    pad.lx = 255 - pad.lx; pad.ly = 255 - pad.ly;
+    pad.rx = 255 - pad.rx; pad.ry = 255 - pad.ry;
+  }
   // Scripted presses (diagnostic): hold for 120 ms, then release.
   if (g_script_held && now >= g_script_release_us) g_script_held = 0;
   if (!g_script_held && !g_tap_active && !g_swipe_active && g_script_next < g_script_count &&
@@ -378,7 +465,47 @@ extern "C" int ytv_vita_input_pump() {
              (unsigned long long)((now - g_start_us) / 1000), (unsigned)g_script_held);
     SbLogRaw(msg);
   }
-  current |= g_script_held;
+  // Diagnostic analog test commands share the physical-stick path.
+  const uint32_t scripted_analog=g_script_held&0x80000000u;
+  if(scripted_analog){
+    switch(g_script_held&0xffu){
+      case 1:pad.lx=0;break;
+      case 2:pad.lx=255;break;
+      case 3:pad.ly=0;break;
+      case 4:pad.ly=255;break;
+      case 5:pad.rx=0;break;
+      case 6:pad.rx=255;break;
+      case 7:pad.ry=0;break;
+      case 8:pad.ry=255;break;
+    }
+  }else current |= g_script_held;
+  // L analog produces D-pad pulses in both Cobalt and native Add-ons.
+  // A released poll between pulses guarantees a new press on each repeat.
+  if(g_analog_pulse && now>=g_analog_release)g_analog_pulse=0;
+  else if(!g_analog_pulse){
+    const uint32_t step=stick_step(g_left_stick,pad.lx,pad.ly,now);
+    if(step){
+      g_analog_pulse=step;g_analog_release=now+60000;
+      char msg[96];snprintf(msg,sizeof(msg),"YTV_V063_ANALOG_NAV direction=0x%x\n",(unsigned)step);
+      SbLogRaw(msg);
+    }
+  }
+  current|=g_analog_pulse;
+  // R analog is reserved for media adjustments. No D-pad leaks to Cobalt.
+  if(!ytv_addons_menu_open()){
+    const uint32_t step=stick_step(g_right_stick,pad.rx,pad.ry,now);
+    if(step){
+      // v0.64: right = volume up, left = down; up = brighter, down = dimmer
+      // (brightness_delta > 0 lowers the dimming level).
+      ytv_addons_adjust_media(step==SCE_CTRL_RIGHT?5:step==SCE_CTRL_LEFT?-5:0,
+                             step==SCE_CTRL_UP?1:step==SCE_CTRL_DOWN?-1:0);
+      g_ytv_last_input_us=now;
+    }
+  }else{
+    g_right_stick.direction=0;
+    g_right_stick.next=0;
+  }
+
   // Gesture steps: 90 ms press, then at least one released poll before the next.
   if (g_gesture_held && now >= g_gesture_release_us) {
     g_gesture_held = 0;
@@ -388,6 +515,23 @@ extern "C" int ytv_vita_input_pump() {
     g_gesture_release_us = now + 90000;
   }
   current |= g_gesture_held;
+  // While a player exists, START sends the standard TV Subtitle key.
+  // Cobalt/YouTube owns actual caption state and track availability.
+  // Square keeps its real Gamepad3 event until a reliable comments action
+  // is confirmed; do not fake a comments click at a fixed coordinate.
+  const bool shortcut_context=ytv_native_player_present() &&
+      !ytv_addons_menu_open() && !(current&SCE_CTRL_SELECT);
+  static bool start_consumed=false;
+  if(shortcut_context && (current&SCE_CTRL_START) &&
+     !(g_shortcut_previous&SCE_CTRL_START)){
+    start_consumed=true;
+    g_ytv_last_input_us=now;
+    send_media_key(window,kSbKeySubtitle);
+    SbLogRaw("YTV_V063_SHORTCUT captions_key\n");
+  }
+  g_shortcut_previous=current;
+  if(!(current&SCE_CTRL_START))start_consumed=false;
+  if(start_consumed)current&=~SCE_CTRL_START;
   SbInputData events[16];
   // The add-on menu (SELECT) takes the buttons while it is open; Cobalt then
   // sees no change. Buttons held when it closes are released only after
@@ -412,7 +556,7 @@ extern "C" int ytv_vita_input_pump() {
           k == kSbKeyGamepadDPadRight)
         ytv_ui_sound(1);
       else if (k == kSbKeyGamepad1)
-        ytv_ui_sound(2);
+        ytv_ui_sound(6);  // entering a video / navigating forward
       else if (k == kSbKeyGamepad2)
         ytv_ui_sound(3);
     }

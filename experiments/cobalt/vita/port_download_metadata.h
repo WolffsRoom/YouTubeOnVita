@@ -7,7 +7,12 @@
 struct YtvVideoMetadata {
   std::string title;
   std::string artist;
-  std::string genre;
+  std::string genre;    // only explicit musical style, not broad "Music" category
+  std::string album;    // only when the service supplies musical album
+  std::string album_artist;
+  std::string year;     // original recording/release year when available
+  std::string track;    // optional track number
+  std::string source_url;
 };
 
 // Extract only the intended videoDetails / playerMicroformatRenderer scope.

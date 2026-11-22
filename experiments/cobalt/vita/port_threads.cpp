@@ -120,6 +120,19 @@ int g_cpu_mask=SCE_KERNEL_CPU_MASK_USER_ALL;
 int g_cpu_count=3;
 pthread_once_t g_cpu_once=PTHREAD_ONCE_INIT;
 void probe_cpu_mask(){
+#if defined(YTV_V061_THREE_CORES)
+  // Experimental A/B mode: exclude the CapUnlocker system core to test
+  // cross-core TLB synchronization as a cause of V8 DFSR=7 faults.
+  const int result=sceKernelChangeThreadCpuAffinityMask(
+      0,SCE_KERNEL_CPU_MASK_USER_ALL);
+  g_cpu_mask=SCE_KERNEL_CPU_MASK_USER_ALL;
+  g_cpu_count=3;
+  char line3[120];
+  snprintf(line3,sizeof(line3),
+       "V061_CPU_SAFE_MODE cores=3 mask=0x%x result=0x%x\n",
+       (unsigned)g_cpu_mask,(unsigned)result);
+  SbLogRaw(line3);
+#else
   const int four=SCE_KERNEL_CPU_MASK_USER_ALL|SCE_KERNEL_CPU_MASK_SYSTEM;
   if(sceKernelChangeThreadCpuAffinityMask(0,four)>=0){
     g_cpu_mask=four;
@@ -127,6 +140,7 @@ void probe_cpu_mask(){
   }else{
     sceKernelChangeThreadCpuAffinityMask(0,SCE_KERNEL_CPU_MASK_USER_ALL);
   }
+#endif
   char line[96];
   snprintf(line,sizeof(line),"YTV_LIFECYCLE_CPU_CORES %d (mask=0x%x)\n",g_cpu_count,g_cpu_mask);
   SbLogRaw(line);

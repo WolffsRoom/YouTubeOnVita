@@ -1,0 +1,49 @@
+/* Vita Browser user-agent style sheet. Replaces Cobalt's 773-byte TV sheet
+   (which only sets display) so ordinary web pages get the usual defaults:
+   white page, margins, headings, lists, links. Only properties Cobalt's
+   layout supports are used; anything else would be ignored. */
+area, base, basefont, datalist, head, link, meta, noembed, noframes, param,
+rp, script, source, style, template, track, title { display: none; }
+
+html, body, address, article, aside, blockquote, center, details, dialog,
+dd, div, dl, dt, fieldset, figcaption, figure, footer, form, h1, h2, h3, h4,
+h5, h6, header, hgroup, hr, legend, li, listing, main, menu, nav, ol, p,
+plaintext, pre, section, summary, table, tbody, thead, tfoot, tr, ul, xmp {
+  display: block;
+}
+td, th, caption { display: inline-block; vertical-align: top; padding: 2px 4px; }
+img, video, input, button, select, textarea { display: inline-block; }
+
+html { background-color: #ffffff; color: #000000; }
+body { margin: 8px; font-family: sans-serif; font-size: 16px; line-height: 1.35; }
+
+p, dl, figure, pre, blockquote, ul, ol, menu, table, fieldset { margin-top: 1em; margin-bottom: 1em; }
+blockquote, figure { margin-left: 40px; margin-right: 40px; }
+dd { margin-left: 40px; }
+ul, ol, menu { padding-left: 40px; }
+center { text-align: center; }
+
+h1 { font-size: 2em; margin-top: 0.67em; margin-bottom: 0.67em; font-weight: bold; }
+h2 { font-size: 1.5em; margin-top: 0.83em; margin-bottom: 0.83em; font-weight: bold; }
+h3 { font-size: 1.17em; margin-top: 1em; margin-bottom: 1em; font-weight: bold; }
+h4 { font-size: 1em; margin-top: 1.33em; margin-bottom: 1.33em; font-weight: bold; }
+h5 { font-size: 0.83em; margin-top: 1.67em; margin-bottom: 1.67em; font-weight: bold; }
+h6 { font-size: 0.67em; margin-top: 2.33em; margin-bottom: 2.33em; font-weight: bold; }
+th, b, strong, dt, legend, summary { font-weight: bold; }
+i, em, cite, var, dfn, address { font-style: italic; }
+small { font-size: 0.83em; }
+big { font-size: 1.17em; }
+pre, code, kbd, samp, tt, xmp, listing, plaintext { font-family: monospace; }
+pre, xmp, listing, plaintext { white-space: pre; }
+
+a { color: #1a0dab; text-decoration: underline; }
+u, ins { text-decoration: underline; }
+s, strike, del { text-decoration: line-through; }
+hr { height: 0; border-top: 1px solid #a0a0a0; margin-top: 0.5em; margin-bottom: 0.5em; }
+fieldset { border: 2px solid #c0c0c0; padding: 0.35em 0.75em 0.625em; }
+
+input, select, textarea, button {
+  font-family: sans-serif; font-size: 14px; color: #000000;
+  background-color: #ffffff; border: 1px solid #767676; padding: 2px 4px;
+}
+button { background-color: #efefef; }

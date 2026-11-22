@@ -231,3 +231,209 @@ Tests: Starboard 193/193 with the new sync primitives. Vita3K: video with sound 
 - VPK is now 18.2 MB (was 20.0). The four LiveArea files match the sources byte for byte. param.sfo: APP_VER 00.27, ATTRIBUTE2 12, TITLE "YouTube", TITLE_ID YTVCB0001.
 - The removed files were used only by other test VPKs (cacert.pem by tls_test).
 - Vita3K smoke test: boots, a player is created.
+
+## v0.29: hardware report for v0.27 (stuttering video, lost sign-in animation, Music-tab artefacts and crash)
+
+- Hardware log (logs-psv/v027):
+  - Only ~10 MiB of phycont free, and CDRAM 0 (vitaGL took all 112 MiB).
+  - Every 1280x720 and 854x480 player failed (ok=0); YouTube fell back to 640x360.
+  - The failing creations at start-up are the likely reason the YouTube TV sign-in animation (a video) disappeared.
+- UI on hardware renders at ~57-60 fps (about 290-305 frames per 5 s). During playback only 18-44 frames per 5 s, with the Rasterizer mostly idle.
+- Fixes:
+  1. vglInitWithCustomThreshold leaves 20 MiB of CDRAM for the decoder. alloc_device_memory tries phycont first, then CDRAM. Vita3K: player now gets the 1280x720 capacity tier.
+  2. **Upside-down video.** With a content_region smaller than the plane (854 of a 864 pitch), Cobalt uses its region transform (textured_mesh_renderer.cc, translate_y = (H - bottom)/H), which assumes a bottom-up origin; the full-texture case uses identity texcoords. Planes now report the full decoder layout (pitch x h16) with a full content_region; info.width/height keep the picture size. The macroblock padding (at most 15 px of edge content) is shown slightly scaled. Strided linear textures (exact size) do not work through vitaGL: it rewrites the mip/filter control bits, which hold the stride. Verified upright in Vita3K.
+  3. YTV_LIFECYCLE_PLAYER_STATS every 5 s while playing, always logged: decoded, shown, dropped, frame_calls, decode ms, free slots, input queue, audio ring.
+- Vita3K 854x480: 150 decoded / about 140 shown per 5 s (30 fps stream).
+- Music-tab artefacts and crash: no dump in this log set; possibly the same odd-size video previews (now upright) or player creation failures. Not confirmed.
+- Tests: Starboard 193/193.
+
+## v0.30: video pacing, start-up V8 crash, intro, gate shadow
+
+- **Hardware playback after v0.29.**
+  - 720p plays: 120 decoded and 120 shown per 5 s on a 24 fps stream, 0 dropped, frame_calls 300 per 5 s (60 Hz).
+  - The "back and forth" frame time came from a stepped media clock: frames_played advanced in 1024-frame (23 ms) steps.
+  - The clock is now interpolated with the system timer between audio steps (capped at one step) and is monotonic; it resets on seek.
+  - Vita3K 854x480: dropped frames went from 7-13 to 0-1 per 5 s.
+- **Start-up crash ("AFK"; it actually happened about 17 s after launch).**
+  - Same libcobalt offset as the v0.25 "first sign-in" crash: pc +0x959014, lr +0x95eb0c.
+  - The code is V8 object-type checks (load map from [obj-1], instance type 0xb0/0xa1), with a data abort at 0x89044600.
+  - That address is inside one of our SbMemoryMap blocks (0x89040000, 0x7f000) and was readable in the dump.
+  - Suspected cause: kuKernelMemProtect(PROT_NONE) on sub-ranges (partial unmap, decommit) briefly affecting neighbouring live pages.
+  - Partial unmaps and flags==0 protects of part of a block no longer touch the page tables. Protects that grant access (commit, JIT RX/RW) still do.
+  - Needs hardware confirmation.
+- **Intro / sign-in animation.**
+  - A Vita3K bisect showed v0.24 boots into the welcome/sign-in screen (with its animation), while v0.25+ go straight to Home.
+  - v0.25 fixed persistence, so YouTube now remembers the device and skips first-run onboarding, as it does on TVs. Not a regression; deleting ux0:data/youtubevita/storage brings it back.
+  - The cached splash (cache/splash_screen/.../splash.html, plus a "music" topic splash) is written and loaded correctly.
+- **LiveArea gate.**
+  - startup.png's logo shadow used black palette entries with partial alpha (tRNS, 111 levels); the LiveArea draws it as a solid square.
+  - The shadow is now baked onto #232323 (the bg0 base colour) as an opaque 8-bit palette PNG: 2.8 KB, was 4.7 KB. The original is kept as startup_alpha_original.png.
+  - template.xml was missing from assets/livearea; recreated (a1, content-rev 4). The user renamed the assets to bg0.png/startup.png; CMake paths updated.
+- **Music tab.** In-row video previews play inside the focused tile; one dark music-video preview looked partially black, which may be the content itself. Not confirmed as a defect.
+- PLAYER_STATS counters are now per player (serial number; addresses are reused).
+- Tests: Starboard 193/193. Vita3K: 720p and 480p playback steady at 150/150 per 5 s (30 fps).
+
+## v0.31: frames shown out of order on hardware
+
+- Owner's recording of v0.30 on hardware shows the picture alternating back and forth at full frame rate. The counts were perfect (150 decoded and 150 shown per 5 s), so frames were reordered, not dropped.
+- Cause: each output picture was labelled with the smallest pending sample pts, assuming display-order output. The pts now comes from the decoder itself (SceAvcdecPicture.info.pts, the access unit's pts). It falls back to the old guess only when it matches no submitted sample (logged as YTV_LIFECYCLE_PLAYER pts_fallback).
+- PLAYER_STATS now includes backwards=N (shown frames with a pts lower than the previous one); it should stay 0. Vita3K: backwards=0 and no fallbacks, but Vita3K's FFmpeg decoder already outputs in display order, so only hardware can confirm the fix.
+- **Crash in the Music tab (dump in logs-psv/v030).** Same V8 site as before (libcobalt +0x959014 / +0x95eb0c), with the object again near offset 0x45a0 of an SbMemoryMap block. The v0.30 change (no PROT_NONE on sub-ranges) did not prevent it, so that hypothesis is ruled out. Cause unknown.
+  - Seen at start-up and in the Music tab while preview players were being created.
+  - Next hardware experiment: jit=0 in ux0:data/youtubevita/cobalt_config.txt, to separate JIT/cache-coherency problems from the rest.
+- Tests: Starboard 193/193.
+
+## v0.32: diagnostics for lyrics mode; text-shadow boxes under investigation
+
+- **Hardware v0.31.** Video plays with backwards=0 and 0-2 dropped per 5 s at 30 fps; the owner reports playback is now good.
+- **Lyrics mode (logs-psv/v031 lyrics music).**
+  - The stream is 720x720. The player is created (1280x720 tier), but decoded=0 and shown=0 with dec_ms of about 2.2 s per 5 s and vin=0: samples are consumed and no picture comes out.
+  - YouTube then shows "Something went wrong".
+  - Decode errors were only in the verbose log; they are now always logged (first 8: YTV_LIFECYCLE_PLAYER avcdec decode error code/size/layout/stream).
+- **Black boxes behind text over video/images.**
+  - Reproduced in Vita3K with the default direct-gles rasterizer; rasterizer=hardware draws the same text without boxes, but has other defects (clipped thumbnails).
+  - direct-gles draws every TextNode through FallbackRasterize: Skia renders into an offscreen RGBA8 atlas, which is cleared to transparent once per atlas reset, and the result is composited with src-alpha blending.
+  - Ruled out: Skia alpha-only render targets (the only FBO attachment format logged is GL_RGBA, no incomplete FBO) and blending during vitaGL's glClear (forcing an unblended clear changed nothing; reverted).
+  - Open.
+- Tests: Starboard 193/193.
+
+## v0.33: herd wake-ups in the parking lot (video lag on hardware)
+
+- **Hardware log (logs-psv/v031 lag).**
+  - From about 13 s, ServiceWorkerRegistry, the three "V8 DefaultWorker" threads, Watchdog, ScrollEngine and ThreadPool each used up to about 4 s of CPU per 5 s.
+  - frame_calls fell to 2-20 per window and the media clock advanced about 1.5 s per window. No SYNC_ERROR was logged.
+- **Cause (the v0.26 design).** futex_wake broadcast a whole bucket (sceKernelSignalLwCondAll) for every Signal. The V8 workers share one condition variable, so every posted task woke all of them, plus any thread hashed to the same bucket. With a steady stream of tasks they spun.
+- **Fix: a real parking lot.**
+  - 64 bucket LwMutexes guard lists of parked waiters; each waiter records its address and sleeps on its own semaphore.
+  - futex_wake(address, n) wakes exactly n threads parked on that address: Signal and mutex unlock wake 1, Broadcast wakes all.
+  - A timed-out waiter unlinks itself, or consumes a signal that is already posted.
+  - Per-thread semaphores live in a 256-slot table keyed by kernel thread id, without pthread TLS, because the main thread and raw kernel threads also park. Slots of threads that have exited are reclaimed when the table is full.
+- The UI audio sink thread is now a pthread (its Cobalt callbacks take SbMutex), like the player audio and microphone threads.
+- Tests: Starboard 193/193. Vita3K: playback 120-155 decoded per 5 s, no SYNC_ERROR; a 90 s UI and search run completed.
+
+## v0.34: newlib heap too small for media buffers (crash while watching)
+
+- **Hardware v0.33.** The herd spin is gone: idle Watchdog, V8 DefaultWorker and NetworkModule show 0 ms. 854x480 at 60 fps plays: 300 decoded per 5 s, 230-300 shown.
+- **Crash after a while of playback (logs-psv/V033).**
+  - Data abort in libcobalt's musl memcpy (+0x1729e88, stmia to the destination) with dst = NULL: an unchecked allocation failure.
+  - newlib_used peaked at 60.6 MiB against a 64 MiB _newlib_heap_size_user, while user_free was about 143 MiB. Media buffers come from SbMemoryAllocate, which uses newlib malloc.
+- **Fix.**
+  - _newlib_heap_size_user raised to 112 MiB. Vita3K: about 128 MiB of user memory still free during playback.
+  - SbMemoryAllocate, Reallocate and AllocateAligned failures are logged without verbose (YTV_LIFECYCLE_ALLOC_FAIL size/newlib_used, first 8).
+- Tests: Starboard 193/193.
+
+## v0.35: UI smoothness, step 1 (core isolation + pacing metrics)
+
+- **Data so far (hardware).** The UI reaches about 60 fps in many windows (290-305 frames per 5 s). Stutter comes from peaks: MainWebModule (JS/style/layout) saturates one core and shares the CPU with V8 compilers, image decode, network and video previews.
+- **Core isolation.**
+  - Every SbThreadCreate thread starts on all cores except core 0.
+  - MainWebModule is pinned to core 0 alone, with priority 128 (ScrollEngineThread also 128).
+  - The process main thread and the audio threads keep all cores.
+  - Logged once as YTV_LIFECYCLE_AFFINITY.
+  - Switchable with cobalt_config "affinity=0" (the config line is now YTV_LIFECYCLE_CONFIG).
+  - Also fixed: run_thread applied priority and mask after SbThreadSetName, which could undo the naming policy.
+- **Frame pacing in GL_STATS** (always logged): max_frame_ms plus counts of frame intervals over 20 ms and over 40 ms. Gaps over 250 ms count as idle, not jank.
+- **Vita3K.** Emulator-bound, so not representative: 720p60 showed about 105 of 300 frames per 5 s with affinity on or off. No regression; Starboard 193/193.
+- **Next step:** compare affinity=1 with affinity=0 on hardware with the same navigation (max_frame_ms, over20/over40, YTV_THREAD_CPU), then target what the data shows.
+
+## v0.36: adaptive buffer, network resume, add-ons, gray splash start
+
+- Video buffer budget is adaptive (`port_media_policy.cpp`): base 12/20/30 MiB
+  (<=480p/720p/1080p) plus up to 2x base from free newlib heap above a 40 MiB
+  reserve, capped at 64 MiB; GC threshold 30 s.
+- Network watcher (`ytv_vita_network_poll`, main loop, 1 s) sends
+  OsNetworkConnected/Disconnected so the page sees online/offline.
+- Playback speed 0.25x-2x: `time_stretch.h` (WSOLA, 1024/512, +-128 search).
+  Host test with a 440 Hz sine: pitch kept (439.8-440.2 Hz), duration ratio
+  exact at 0.5/0.75/1.25/1.5/2.0. Vita3K at 1.5x (force_rate.txt diagnostic):
+  media clock 7.5 s per 5 s, audio continuous.
+- Native add-on menu (`port_addons.cpp`, SELECT or three-finger tap): sleep
+  timer (sends kSbKeyPause; Vita3K: YouTube paused), screen off
+  (scePowerRequestDisplayOff, any button turns it on; hardware only), PNG
+  screenshot from the displayed framebuffer to ux0:picture/YouTubeVita
+  (file written in Vita3K, but Vita3K returns black pixels; hardware only).
+  GL overlay drawn before eglSwapBuffers with state save/restore; idle path
+  writes into the display buffer when no swaps for 120 ms.
+- Keep-awake: sceKernelPowerTick while audio plays (auto-suspend only when
+  the screen is off).
+- Startup: display cleared to #212121 right after vglInit;
+  SplashScreenWebModule gets priority 128 (hardware v0.33 log showed the
+  splash presenting a single frame between 5 s and 13 s).
+
+## v0.37: decode-target lifetime, file errors, freeze, lyrics fallback, double tap
+
+- Artifacts while scrolling suggestions (lines from card corners, blue
+  polygon, black text boxes): SbDecodeTargetRelease was a no-op and
+  SbPlayerDestroy deleted the textures and freed the player that held the
+  target, while Cobalt's render-tree images still used them (freed info,
+  recycled texture ids). Targets are now ref-counted (one ref per
+  GetCurrentFrame, released by SbDecodeTargetRelease), own their textures and
+  a ref on the GPU-mapped frame pool; dead targets are freed 3 swaps later on
+  the GL thread (ytv_player_on_swap) or with glFinish before a new decoder is
+  created. PLAYER_STATS shows targets=/dead=.
+- Startup crash (Vita3K, ALLOC_FAIL size=0x80010060 while loading certs):
+  sceIoLseek returned an SCE error as a positive 64-bit value and Cobalt used
+  it as a file size. SbFileSeek/Read/Write now map errors to -1
+  (YTV_LIFECYCLE_FILE_ERROR).
+- UI freeze (v0.36 hardware log): MainWebModule spun alone on core 0 for
+  46 s then stopped. affinity now defaults to 0; SbThreadYield sleeps 100 us
+  instead of sched_yield (which never lets lower-priority threads run).
+- Lyrics view (720x720): every sample failed with
+  SCE_AVCDEC_ERROR_UNSUPPORT_IMAGE_SIZE. After 3 such errors the decoder is
+  recreated at the stream's exact size; if that fails the player continues
+  audio-only (video_broken). Not verified on hardware.
+- Double tap left/right third while a video plays: D-pad steps (first one
+  shows the controls) + X commit, 600 ms apart. Vita3K: SbPlayerSeek
+  27 s -> 36.96 s and playback resumed. MediaFastForward/Rewind + Enter or
+  Gamepad1 did not seek.
+- Add-on menu redesign (bold font, icons, clock/battery, pill values),
+  screen off only wakes with SELECT, toast before screen off and on timer
+  expiry. Signed time comparisons (audio-active check was racing).
+- Linker: ytv_cobalt_boot uses -z max-page-size=0x10000 (vita-elf-create
+  needed ~4.4 KiB between segments).
+- Text black boxes: still open. Ruled out in Vita3K: rasterizer (same with
+  hardware), highp in the box-shadow shader, uninitialised RGBA/A8 textures
+  (zeroed: no change), blurred glyph uploads (they contain gradients).
+  Remaining suspects: scissored glClear on FBOs, offscreen region reuse.
+
+## Storage encryption (after v0.38)
+
+- Problem (reported by the user): ux0:data/youtubevita/storage/*.dat (Cobalt
+  cookie jar + localStorage, i.e. the YouTube session tokens) was plaintext
+  and readable/copyable by any homebrew, FTP or backup.
+- port_storage.cpp now seals every record with XChaCha20-Poly1305
+  (libsodium): file = "YTVENC01" | 24-byte nonce (sceKernelGetRandomNumber) |
+  ciphertext | tag; associated data = file name. Key = BLAKE2b-256(
+  "YouTubeVita/storage/v1" | OpenPSID, key = app pepper); never stored.
+  Never falls back to plaintext. sodium_init() is NOT called (its RNG setup
+  broke start-up in Vita3K; the primitives used do not need it).
+- Legacy plaintext: migrated when opened (STORAGE_MIGRATED) plus a one-time
+  sweep of the folder (STORAGE_SWEEP), plaintext .backup/.new removed.
+  Undecryptable/tampered record -> empty record (STORAGE_DECRYPT_FAILED).
+- Verified in Vita3K: migration, re-open after restart, ciphertext on disk
+  (no printable runs), one flipped byte rejected. Unit tests 193/193.
+- Limit: protects copies off the console; code on the same console with
+  this knowledge or with kernel access can still derive the key or read the
+  process memory.
+- starboard_vita15 now declares its full link dependencies (curl/ssl/crypto
+  for port_downloads.cpp, sodium, vitaGL, zlib, zstd, stubs) so the test
+  executables link again.
+
+## v0.39: storage encryption, "Screen & info" page, Full HD (beta)
+
+- Includes the user's own changes (menu pages Home/Player/Settings,
+  port_downloads.cpp, AdBlock DNS filter, quality/format/language settings)
+  as found in the tree; not developed or tested by me.
+- New Home entry "Screen & info" (kPageDisplay): Full HD (beta), Darken
+  screen (20-90 %, black quad over the frame, backlight untouched),
+  Performance HUD (fps, worst frame, RAM/VRAM free, video height, dropped/s),
+  Clock and battery. Settings saved in addons.cfg (fhd/dim/perf/clock).
+- Full HD: needs a restart. vitaGL keeps 40 MiB CDRAM instead of 20,
+  sceVideodecInitLibraryNongameapp(1920x1088), 1080p decoders only then,
+  CanPlay 1080p only at <= 30 fps, drawn scaled to 960x544. If a 1080p
+  decoder gives 5 errors and no picture: Full HD off for the run, player
+  audio-only. Crash guard: ux0:data/youtubevita/fhd_probe; a start that finds
+  it turns Full HD off and saves it (verified in Vita3K, where the non-game
+  decoder NIDs are missing and the first run crashes).
+- Not verified on hardware: whether the non-game decoder works with
+  sceAvcdecDecode from a homebrew app.

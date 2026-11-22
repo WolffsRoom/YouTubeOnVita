@@ -358,6 +358,18 @@ static int get_init_array(uint32_t *addr,uint32_t *length){
 
 int main(void) {
 #if defined(YTV_COBALT_BOOT_STAGE)
+  // v0.64: every session starts with fresh logs. The previous session is kept
+  // once as *_prev.log so a crash log survives the relaunch that follows it.
+  {
+    static const char* const kLogs[][2]={
+      {"ux0:data/youtubevita/cobalt_boot.log","ux0:data/youtubevita/cobalt_boot_prev.log"},
+      {"ux0:data/youtubevita/starboard15.log","ux0:data/youtubevita/starboard15_prev.log"},
+    };
+    for(unsigned i=0;i<sizeof(kLogs)/sizeof(kLogs[0]);++i){
+      sceIoRemove(kLogs[i][1]);
+      if(sceIoRename(kLogs[i][0],kLogs[i][1])<0)sceIoRemove(kLogs[i][0]);
+    }
+  }
   {
     // RAM granted to this process by its param.sfo memory mode: what is free
     // now plus what is already committed (newlib heap, eboot image, stack).
@@ -378,8 +390,8 @@ int main(void) {
   { extern int ytv_vita_cpu_mask(void); ytv_vita_cpu_mask(); }  // probes CapUnlocker 4th core
 #endif
 #if defined(YTV_COBALT_BOOT_STAGE)
-  // Render the user-requested intro without VitaGL: splash framebuffer and
-  // temporary audio are disposed before loading the 34-MiB Cobalt image.
+  // The custom splash video + its own PCM jingle play exactly once here.
+  // VitaGL's stock splash is disabled at link time; do not mute our audio.
   { extern int ytv_native_startup_splash(void);
     int intro=ytv_native_startup_splash();
     char intro_msg[200];
@@ -389,7 +401,7 @@ int main(void) {
     extern int ytv_native_startup_splash_frames_dropped(void);
     extern int ytv_native_startup_splash_vblank_fallbacks(void);
     snprintf(intro_msg,sizeof(intro_msg),
-       "YTV_NATIVE_SPLASH result=%d audio_status=%d audio_started=%d "
+       "YTV_CUSTOM_SPLASH result=%d audio_status=%d audio_started=%d "
        "presented=%d skipped=%d vblank_fallbacks=%d",
        intro,ytv_native_startup_splash_audio_status(),
        ytv_native_startup_splash_audio_started(),
@@ -704,12 +716,48 @@ int main(void) {
       }
       uint8_t first_text_bytes[16];
       memcpy(first_text_bytes,image+xstart,16);
-      int protection=kuKernelMemProtect(image+xstart,xlen,
-                                        KU_KERNEL_PROT_READ|KU_KERNEL_PROT_EXEC);
+      // v0.61 diagnostic: the issue #2 logs consistently terminate before
+      // the old monolithic (~24 MiB) kuKernelMemProtect call. Use smaller
+      // page-aligned 1 MiB chunks and durable pre-call checkpoints to
+      // distinguish an unsupported page-protection operation from the V8
+      // initialization problems observed after the call.
+      int protection=0;
+#if defined(YTV_V061_RX_CHUNKS)
+      const uint32_t rx_chunk=1024u*1024u;
+      uint32_t rx_done=0;
+      note_u32("V061_RX_PROTECT_BEGIN",xstart,xlen);
+      while(rx_done<xlen){
+        uint32_t n=xlen-rx_done;
+        if(n>rx_chunk)n=rx_chunk;
+        note_u32("V061_RX_CHUNK_ENTER",xstart+rx_done,n);
+        protection=kuKernelMemProtect(image+xstart+rx_done,n,
+                         KU_KERNEL_PROT_READ|KU_KERNEL_PROT_EXEC);
+        if(protection<0){
+          note_u32("V061_RX_CHUNK_FAILED",(unsigned)protection,xstart+rx_done);
+          break;
+        }
+        rx_done+=n;
+      }
+      note_u32("V061_RX_PROTECT_PROGRESS",rx_done,xlen);
+      if(rx_done!=xlen && protection>=0)protection=-1;
+#else
+      protection=kuKernelMemProtect(image+xstart,xlen,
+                           KU_KERNEL_PROT_READ|KU_KERNEL_PROT_EXEC);
+#endif
       note_u32("COBALT_TEXT_RX_PROTECTION", (unsigned)protection, xlen);
       check(protection==0,"kubridge maps official Cobalt code segment R-X");
       if(failures)goto release;
+#if defined(YTV_V061_RX_CHUNKS)
+      log_line("V061_RX_FLUSH_BEGIN");
+      for(uint32_t off=0;off<xlen;off+=rx_chunk){
+        uint32_t n=xlen-off;
+        if(n>rx_chunk)n=rx_chunk;
+        kuKernelFlushCaches(image+xstart+off,n);
+      }
+      log_line("V061_RX_FLUSH_COMPLETE");
+#else
       kuKernelFlushCaches(image+xstart,xlen);
+#endif
       check(memcmp(first_text_bytes,image+xstart,16)==0,
             "Cobalt original text remains intact after RX permissions");
 

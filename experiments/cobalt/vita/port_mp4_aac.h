@@ -18,3 +18,5 @@ struct YtvMp4Audio {
   uint64_t file_bytes = 0;
 };
 bool ytv_mp4_parse_audio(SceUID file, YtvMp4Audio& out);
+bool ytv_mp4_parse_audio_moov(const uint8_t* moov,size_t bytes,
+                              uint64_t max_file_bytes,YtvMp4Audio& out);

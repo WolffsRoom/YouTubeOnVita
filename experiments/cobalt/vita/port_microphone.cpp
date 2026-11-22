@@ -8,6 +8,8 @@
  */
 #include "starboard/microphone.h"
 #include "starboard/log.h"
+// The existing UI SFX worker handles short cues asynchronously.
+extern "C" void ytv_ui_sound(int kind);
 #include <psp2/audioin.h>
 #include <psp2/kernel/threadmgr.h>
 #include <pthread.h>
@@ -126,6 +128,10 @@ bool SbMicrophoneOpen(SbMicrophone m) {
   }
   m->thread_running = true;
   m->open = true;
+  // Only after sceAudioIn successfully opened: do not beep for denied or
+  // failed microphone requests. UI Sounds OFF suppresses this automatically.
+  SbLogRaw("YTV_MIC_ACTIVE signal=recording audio_cue=7\n");
+  ytv_ui_sound(7);
   return true;
 }
 bool SbMicrophoneClose(SbMicrophone m) {
@@ -137,6 +143,9 @@ bool SbMicrophoneClose(SbMicrophone m) {
   sceAudioInReleasePort(m->port);
   m->port = -1;
   m->open = false;
+  // Sound on microphone cancellation / capture close, not on failed opens.
+  ytv_ui_sound(8);
+  SbLogRaw("YTV_MIC_INACTIVE audio_cue=8\n");
   pthread_mutex_lock(&m->lock);
   m->read_pos = m->count = 0;
   pthread_mutex_unlock(&m->lock);

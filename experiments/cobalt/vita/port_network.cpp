@@ -4,6 +4,7 @@
  * No fake answers; failed or unsupported features return errors.
  */
 #include "starboard/time.h"
+#include "starboard/system.h"
 #include <cstdio>
 #include "starboard/log.h"
 #include "starboard/socket.h"
@@ -27,28 +28,49 @@ struct SbSocketPrivate {
 };
 
 namespace {
-pthread_once_t net_once=PTHREAD_ONCE_INIT;
+pthread_mutex_t net_init_mu=PTHREAD_MUTEX_INITIALIZER;
 void* net_heap=nullptr;
 bool net_ready=false;
-void init_net() {
-  int module=sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
-  (void)module; // module can already be loaded on Vita3K.
-  net_heap=memalign(4096,1024*1024);
-  if(!net_heap)return;
+uint64_t net_last_attempt_us=0;
+bool ensure_net() {
+  if(__atomic_load_n(&net_ready,__ATOMIC_ACQUIRE))return true;
+  pthread_mutex_lock(&net_init_mu);
+  if(net_ready){
+    pthread_mutex_unlock(&net_init_mu);
+    return true;
+  }
+  const uint64_t now=(uint64_t)SbTimeGetMonotonicNow();
+  if(net_last_attempt_us && now>=net_last_attempt_us &&
+     now-net_last_attempt_us<2000000ull){
+    pthread_mutex_unlock(&net_init_mu);
+    return false;
+  }
+  net_last_attempt_us=now?now:1;
+  const int module=sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
+  (void)module; // The module can already be loaded, particularly on Vita3K.
+  if(!net_heap)net_heap=memalign(4096,1024*1024);
+  if(!net_heap){
+    pthread_mutex_unlock(&net_init_mu);
+    SbLogRaw("YTV_NETWORK_NET_INIT malloc_failed retryable=1\n");
+    return false;
+  }
   memset(net_heap,0,1024*1024);
   SceNetInitParam params={};
   params.memory=net_heap;
   params.size=1024*1024;
   params.flags=0;
-  int status=sceNetInit(&params);
-  if(status<0) {
-    free(net_heap);net_heap=nullptr;return;
+  const int status=sceNetInit(&params);
+  const bool available=status>=0;
+  if(!available){
+    free(net_heap);net_heap=nullptr;
   }
-  net_ready=true;
-}
-bool ensure_net() {
-  pthread_once(&net_once,init_net);
-  return net_ready;
+  __atomic_store_n(&net_ready,available,__ATOMIC_RELEASE);
+  pthread_mutex_unlock(&net_init_mu);
+  char line[100];
+  snprintf(line,sizeof(line),"YTV_NETWORK_NET_INIT status=0x%x ready=%d retryable=%d\n",
+           (unsigned)status,(int)available,available?0:1);
+  SbLogRaw(line);
+  return available;
 }
 int net_errno() {
   int *ptr=sceNetErrnoLoc();
@@ -376,6 +398,14 @@ static SbSocketResolution* resolve_impl(const char* hostname,int filters) {
     }
     return nullptr;
   }
+#if defined(YTV_NATIVE_DOWNLOAD_TEST)
+  if(SbSystemNetworkIsDisconnected()){
+    static volatile unsigned count=0;
+    if(__sync_fetch_and_add(&count,1)<12)
+      SbLogRaw("YTV_NETWORK_DIAGNOSTIC_DNS_BLOCKED offline=1\n");
+    return nullptr;
+  }
+#endif
   if(!ensure_net())return nullptr;
   SceNetInAddr address={};
   if(sceNetInetPton(SCE_NET_AF_INET,hostname,&address.s_addr)!=1) {

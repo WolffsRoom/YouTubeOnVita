@@ -195,15 +195,47 @@ bool ytv_parse_video_metadata(const char*response,YtvVideoMetadata&out){
   if(!scope(response,"videoDetails",details))return false;
   read_json_text(details,"title",out.title,700);
   read_json_text(details,"author",out.artist,380);
-  // Prefer an explicit genre; YouTube's broad category is a fallback only
-  // when the server provides it. Never invent a musical style.
+  // Distinguish music from the uploading video channel. The Innertube
+  // videoDetails category and playerMicroformatRenderer "Music" category
+  // do NOT represent musical style. Never put "Music" into ID3 TCON.
   read_json_text(details,"genre",out.genre,180);
+  read_json_text(details,"album",out.album,380);
+  read_json_text(details,"albumArtist",out.album_artist,380);
+  read_json_text(details,"releaseYear",out.year,4);
+  read_json_text(details,"trackNumber",out.track,12);
   std::string micro;
   if(scope(response,"playerMicroformatRenderer",micro)){
     if(out.genre.empty())read_json_text(micro,"genre",out.genre,180);
-    if(out.genre.empty())read_json_text(micro,"category",out.genre,180);
+    if(out.album.empty())read_json_text(micro,"album",out.album,380);
+    if(out.album_artist.empty())read_json_text(micro,"albumArtist",out.album_artist,380);
     if(out.artist.empty())read_json_text(micro,"ownerChannelName",out.artist,380);
   }
+  // A player response can carry dedicated track-level music metadata, but
+  // only consume it when it is an actual typed object. Do not guess missing
+  // artist/album/genre from video descriptions or hashtags.
+  std::string music;
+  if(scope(response,"musicMetadata",music)){
+    std::string real_artist;
+    if(read_json_text(music,"artist",real_artist,380))out.artist=real_artist;
+    if(out.genre.empty())read_json_text(music,"genre",out.genre,180);
+    if(out.album.empty())read_json_text(music,"album",out.album,380);
+    if(out.album_artist.empty())read_json_text(music,"albumArtist",out.album_artist,380);
+    if(out.year.empty())read_json_text(music,"releaseYear",out.year,4);
+    if(out.track.empty())read_json_text(music,"trackNumber",out.track,12);
+  }
+  // Guard against metadata classified as a broad video category.
+  const std::string lc=[&]{std::string t=out.genre;
+    std::transform(t.begin(),t.end(),t.begin(),[](unsigned char c){return (char)std::tolower(c);});
+    return t;
+  }();
+  if(lc=="music" || lc=="musica" || lc=="música" ||
+     lc=="entertainment" || lc=="people & blogs")out.genre.clear();
+  if(out.year.size()!=4 ||
+     !std::all_of(out.year.begin(),out.year.end(),[](char c){return c>='0'&&c<='9';}))
+    out.year.clear();
+  if(out.track.size()>3 ||
+     !std::all_of(out.track.begin(),out.track.end(),[](char c){return c>='0'&&c<='9';}))
+    out.track.clear();
   return !out.title.empty();
 }
 std::string ytv_download_filename(const YtvVideoMetadata&info,
@@ -222,6 +254,10 @@ std::vector<uint8_t> ytv_make_mp3_id3(const YtvVideoMetadata&info,
   textframe(frames,"TIT2",info.title);
   textframe(frames,"TPE1",info.artist);
   textframe(frames,"TCON",info.genre);
+  textframe(frames,"TALB",info.album);
+  textframe(frames,"TPE2",info.album_artist);
+  textframe(frames,"TYER",info.year);
+  textframe(frames,"TRCK",info.track);
   if(jpeg.size()>=4 && jpeg.size()<=384*1024 &&
      jpeg[0]==0xff && jpeg[1]==0xd8 &&
      jpeg[jpeg.size()-2]==0xff && jpeg[jpeg.size()-1]==0xd9){
@@ -247,3 +283,28 @@ std::vector<uint8_t> ytv_make_mp3_id3(const YtvVideoMetadata&info,
   tag.insert(tag.end(),frames.begin(),frames.end());
   return tag;
 }
+
+
+#if defined(YTV_NATIVE_DOWNLOAD_TEST)
+// Real Vita cross-compiled parser/tag writer test; no production behavior.
+extern "C" int ytv_metadata_selftest() {
+  const char* json=R"({"videoDetails":{"title":"Title","author":"Uploader","genre":"Rock"},"musicMetadata":{"artist":"Singer","album":"Album","albumArtist":"Singer & Band","releaseYear":"2022","trackNumber":"04"}})";
+  YtvVideoMetadata meta;
+  if(!ytv_parse_video_metadata(json,meta))return 1;
+  if(meta.artist!="Singer" || meta.genre!="Rock" ||
+     meta.album!="Album" || meta.album_artist!="Singer & Band" ||
+     meta.year!="2022" || meta.track!="04")return 2;
+  auto tag=ytv_make_mp3_id3(meta,{});
+  auto contains=[&](const char* key){
+    return std::search(tag.begin(),tag.end(),key,key+4)!=tag.end();
+  };
+  if(!contains("TIT2") || !contains("TPE1") || !contains("TPE2") ||
+     !contains("TCON") || !contains("TALB") ||
+     !contains("TYER") || !contains("TRCK"))return 3;
+  const char* general=R"({"videoDetails":{"title":"Music","author":"Channel"},"microformat":{"playerMicroformatRenderer":{"category":"Music"}}})";
+  if(!ytv_parse_video_metadata(general,meta) || !meta.genre.empty())return 4;
+  tag=ytv_make_mp3_id3(meta,{});
+  if(std::search(tag.begin(),tag.end(),"TCON","TCON"+4)!=tag.end())return 5;
+  return 0;
+}
+#endif

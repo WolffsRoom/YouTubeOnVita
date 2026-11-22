@@ -2,6 +2,7 @@
   [string]$Vita3K = "C:\Users\wolff\Documents\Vita3k\Vita3K.exe",
   [string]$TitleId = 'YTVCB0001',
   [string]$Vpk = 'YouTube.vpk',
+  [string]$BuildDirectory = '',
   [int]$Seconds = 90,
   [string]$Config = 'vita3k-test.yml',
   [string]$Backend = '',
@@ -16,7 +17,7 @@
 # process started here is ever terminated.
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$BuildDir = if ($TitleId -eq "YTVCB0002") { "build-youtube-lite" } else { "build-youtube" }
+$BuildDir = if ($BuildDirectory) { $BuildDirectory } elseif ($TitleId -eq "YTVCB0002") { "build-youtube-lite" } else { "build-youtube" }
 $VpkPath = Join-Path $Root "$BuildDir\$Vpk"
 $Profile = Join-Path $env:APPDATA 'Vita3K\Vita3K'
 $DataDir = Join-Path $Profile 'ux0\data\youtubevita'
@@ -93,7 +94,9 @@ try {
 Start-Sleep -Seconds 1
 foreach ($k in $Logs.Keys) {
   $fs = [IO.File]::Open($Logs[$k], 'Open', 'Read', 'ReadWrite')
-  $fs.Seek([int64]$Start[$k], 'Begin') | Out-Null
+  # v0.64+: the app starts each session with a fresh log (old one -> *_prev.log).
+  $from = if ($fs.Length -lt [int64]$Start[$k]) { 0 } else { [int64]$Start[$k] }
+  $fs.Seek($from, 'Begin') | Out-Null
   $text = (New-Object IO.StreamReader($fs)).ReadToEnd(); $fs.Close()
   [IO.File]::WriteAllText((Join-Path $Out "$k.log"), $text)
 }

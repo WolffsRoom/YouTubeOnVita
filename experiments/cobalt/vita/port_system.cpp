@@ -13,6 +13,7 @@
 #include "starboard/log.h"
 #include "starboard/cpu_features.h"
 #include <psp2/kernel/rng.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/io/stat.h>
 #include <psp2/apputil.h>
 #include <psp2/system_param.h>
@@ -194,7 +195,12 @@ namespace {
 struct Overrides { char rasterizer[24]; int jit; int swap_interval; int affinity; bool loaded; };
 // affinity defaults to 0 since v0.37: with MainWebModule alone on core 0 a
 // busy wait there froze the UI on hardware (v0.36 "frezee" log).
-Overrides g_ovr = {"direct-gles", 1, 1, 0, false};
+#if defined(YTV_V8_JITLESS_DIAGNOSTIC)
+constexpr int kDefaultJit = 0;  // diagnostic only; jit=1 in cobalt_config.txt overrides this
+#else
+constexpr int kDefaultJit = 1;
+#endif
+Overrides g_ovr = {"direct-gles", kDefaultJit, 1, 0, false};
 void load_overrides(){
   if(g_ovr.loaded)return;
   g_ovr.loaded=true;
@@ -255,7 +261,16 @@ int cfg_reduce_cpu(){return -1;}
 int cfg_reduce_gpu(){return -1;}
 bool cfg_gc_zeal(){return false;}
 const char* cfg_rasterizer(){load_overrides();return g_ovr.rasterizer;}
-bool cfg_enable_jit(){load_overrides();return g_ovr.jit!=0;}  // executable memory via kubridge
+bool cfg_enable_jit(){
+  load_overrides();
+#if defined(YTV_V8_JITLESS_DIAGNOSTIC)
+  // Diagnostic binary must remain jitless even if a user configuration
+  // from an earlier JIT-on build still contains jit=1.
+  return false;
+#else
+  return g_ovr.jit!=0;  // executable memory through kubridge
+#endif
+}
 const char* cfg_splash_topics(){return "";}
 bool cfg_store_compiled_js(){return true;}  // faster start (compiled_js cache)
 
@@ -306,9 +321,19 @@ extern const void* ytv_media_session_extension();
 // page made no swaps and the keyboard froze (v0.48 Lite, Add-ons > IME).
 extern "C" bool ytv_osk_active();
 extern "C" bool ytv_addons_wants_frames();  // port_addons.cpp: menu/toast visible
+extern "C" volatile uint64_t g_ytv_last_input_us; // port_input.cpp
+
 struct YtvGraphicsApi { const char* name; uint32_t version; float (*max_interval)(); };
 extern "C" volatile int g_ytv_graphics_ext_active = 0;
-float ytv_max_frame_interval(){return ytv_osk_active()||ytv_addons_wants_frames()?33.f:-1.f;}
+float ytv_max_frame_interval(){
+  // Request a short burst of frames after any input. A paused/static Cobalt
+  // page can otherwise show no visual response after a playlist transition,
+  // even when the native touch/navigation sounds and event pump still run.
+  const uint64_t now=sceKernelGetSystemTimeWide();
+  const uint64_t last=__atomic_load_n(&g_ytv_last_input_us,__ATOMIC_RELAXED);
+  const bool wake=last && now>=last && now-last<2200000ull;
+  return ytv_osk_active()||ytv_addons_wants_frames()||wake?33.f:-1.f;
+}
 const YtvGraphicsApi kGraphicsApi={"dev.cobalt.extension.Graphics",1,ytv_max_frame_interval};
 const void* SbSystemGetExtension(const char* name){
   if(name && strcmp(name,kGraphicsApi.name)==0){

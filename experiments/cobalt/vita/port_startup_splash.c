@@ -1,15 +1,19 @@
 /*
  * YouTube on Vita native startup, independent from VitaGL/Cobalt.
  *
- * Source asset: "Youtube Splash Screen Animation.lottie", 155 frames at 60 fps.
+ * Full reference YouTube TV startup: 358 video frames at 60 FPS (~5.97s)
+ * with the complete matching stereo 48 kHz PCM audio.
+ * Source: user-provided assets/Start-up YouTube.mp4.
+ * This is NOT the VitaGL/YouTube default splash or an MP4 decoder.
  * Two separate 960x544 ABGR8888 scanout buffers prevent partially decoded
  * frames from being displayed (the old one-buffer path occasionally tore or
  * looked clipped). Swap on VBlank, dropping late source frames rather than
  * running the sound and animation on unrelated clocks.
  *
- * The audio worker primes its port and first PCM block BEFORE frame 0 is
- * presented; it starts on the same VBlank as the visual timeline. The final
- * displayed scanout remains alive until the first VitaGL display swap.
+ * Our custom PCM audio worker primes its first block BEFORE frame 0 and
+ * starts at the same VBlank as the visual timeline. Audio is released
+ * when this animation ends. The final (background-only) scanout stays
+ * alive until Cobalt's first VitaGL swap.
  */
 #include <psp2/display.h>
 #include <psp2/audioout.h>
@@ -26,10 +30,10 @@
 #define W 960
 #define H 544
 #define FPS 60
-#define FRAMES 155
-#define MAX_FILE (2u * 1024u * 1024u)
+#define FRAMES 358
+#define MAX_FILE (4u * 1024u * 1024u)
 #define MAX_RAW (W * H * 4u)
-#define BG 0xFF1F1A1Du
+#define BG 0xFF252525u
 #define SOUND_FRAMES 256
 #define SOUND_RATE 48000
 
@@ -351,8 +355,8 @@ int ytv_native_startup_splash(void) {
 
 finish:
   if (tone >= 0) {
-    // Audio ends naturally at 2.58 s; its lifetime never races the Cobalt
-    // decoder or continues into the user's first YouTube video.
+    // Audio ends naturally at ~5.97s, synchronized with the reference
+    // timeline. Its lifetime never races the Cobalt decoder.
     sceKernelWaitThreadEnd(tone, NULL, NULL);
     sceKernelDeleteThread(tone);
   }

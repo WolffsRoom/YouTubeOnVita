@@ -9,8 +9,15 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <cstdint>
+#include <pthread.h>
 
 extern "C" bool ytv_player_can_decode_1080p();
+extern "C" bool ytv_player_can_decode_portrait();
+// Runtime capability feedback from hardware decoder. With a failed H.264
+// picture size, Starboard must reject this representation on subsequent
+// CanPlay calls so Cobalt can select a lower bitrate/resolution.
+extern "C" void ytv_media_reject_video_size(int width,int height);
 extern "C" bool ytv_lowmem();      // port_system.cpp (YouTube Lite)
 extern "C" bool ytv_lowmem_720();  // port_player.cpp (Lite: 720p unless its crash guard tripped)
 extern "C" unsigned int _newlib_heap_size_user __attribute__((weak));
@@ -18,8 +25,39 @@ namespace {
 constexpr int kMiB=1024*1024;
 constexpr int kAudioBuffer=2*kMiB;
 constexpr int kVideoBuffer=12*kMiB;
+// Sizes the decoder refused this run. v0.63 kept only the last one: two
+// refused Shorts sizes (480x852 and 240x426) replaced each other, YouTube
+// alternated between them forever and the guest home page crashed Cobalt.
+constexpr int kRejectSlots=16;
+volatile uint32_t g_rejected_sizes[kRejectSlots];
+volatile int g_rejected_count=0;
+bool size_rejected(long w,long h){
+  if(w<1 || h<1 || w>0xFFFF || h>0xFFFF)return false;
+  const uint32_t key=((uint32_t)w<<16)|(uint32_t)h;
+  const int n=__atomic_load_n(&g_rejected_count,__ATOMIC_ACQUIRE);
+  for(int i=0;i<n && i<kRejectSlots;i++)
+    if(__atomic_load_n(&g_rejected_sizes[i],__ATOMIC_RELAXED)==key)return true;
+  return false;
+}
 }
 extern "C" {
+void ytv_media_reject_video_size(int width,int height){
+  if(width<1 || height<1 || width>0xFFFF || height>0xFFFF)return;
+  if(size_rejected(width,height))return;
+  static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+  pthread_mutex_lock(&lock);
+  // Full list: the oldest entry is replaced.
+  static int next=0;
+  __atomic_store_n(&g_rejected_sizes[next],((uint32_t)width<<16)|(uint32_t)height,
+                   __ATOMIC_RELAXED);
+  next=(next+1)%kRejectSlots;
+  const int n=__atomic_load_n(&g_rejected_count,__ATOMIC_RELAXED);
+  if(n<kRejectSlots)__atomic_store_n(&g_rejected_count,n+1,__ATOMIC_RELEASE);
+  pthread_mutex_unlock(&lock);
+  char text[128];
+  snprintf(text,sizeof(text),"YTV_MEDIA_DECODER_REJECT_SIZE %dx%d\n",width,height);
+  SbLogRaw(text);
+}
 static SbMediaSupportType can_play(const char* mime, const char* key_system);
 SbMediaSupportType SbMediaCanPlayMimeAndKeySystem(const char* mime,
                                                   const char* key_system) {
@@ -95,9 +133,31 @@ static SbMediaSupportType can_play(const char* mime, const char* key_system) {
     long w = param("width="), h = param("height="), fps = param("framerate=");
     if (param("bitrate=") > 40000000L) return kSbMediaSupportTypeNotSupported;
     if (w > 1920 || h > 1088 || fps > 60) return kSbMediaSupportTypeNotSupported;
+    // v0.59 hardware test: SceAvcdec rejected the YouTube Music 720x720
+    // square H.264 stream with 0x80620005 even after retrying an exact-size
+    // decoder. Don't advertise support for that exact profile: let YouTube
+    // choose a smaller representation instead of audio-only playback.
+    // v0.64: re-enabled. The decoder layout now uses a 32-aligned pitch
+    // (736 for this stream), the likely cause of that refusal. If the
+    // hardware still refuses it, port_player rejects the size at runtime and
+    // asks YouTube for another representation (no permanent audio-only).
+    // if (w == 720 && h == 720) return kSbMediaSupportTypeNotSupported;
+    // R4: allow 1190x720; port_player attempts a padded 1280x720
+    // surface first. Runtime rejection is still enabled if that fails.
+    if(size_rejected(w,h))
+      return kSbMediaSupportTypeNotSupported;
+    // v0.64 portrait (Shorts): above 720 lines only up to 480x854, the
+    // portrait decoder size, and only if SceAvcdec accepts it.
+    const bool portrait = w > 0 && h > w;
+    if (portrait && h > 720) {
+      if (w > 480 || h > 864 || !ytv_player_can_decode_portrait())
+        return kSbMediaSupportTypeNotSupported;
+    }
     if (ytv_lowmem()) {
       const bool hd = ytv_lowmem_720();
-      if (w > (hd ? 1280 : 854) || h > (hd ? 720 : 480)) return kSbMediaSupportTypeNotSupported;
+      // Limits apply to the long and short side (portrait Shorts included).
+      const long lng = portrait ? h : w, sht = portrait ? w : h;
+      if (lng > (hd ? 1280 : 854) || sht > (hd ? 720 : 480)) return kSbMediaSupportTypeNotSupported;
     }
     // Above 1280x720 pixels only the non-game decoder works (probed).
     if (w > 0 && h > 0 && w * h > 1280 * 720) {
@@ -112,6 +172,25 @@ static SbMediaSupportType can_play(const char* mime, const char* key_system) {
   }
   return codecs ? kSbMediaSupportTypeProbably : kSbMediaSupportTypeMaybe;
 }
+#if defined(YTV_NATIVE_DOWNLOAD_TEST)
+// Real ARM/Vita3K policy verification. Compiled out of distributed VPKs.
+int ytv_media_size_selftest(){
+  auto probe=[](int w,int h){
+    char mime[180];
+    snprintf(mime,sizeof(mime),
+      "video/mp4; codecs=avc1.640028; width=%d; height=%d; framerate=30",
+      w,h);
+    return can_play(mime,"");
+  };
+  if(probe(1190,720)==kSbMediaSupportTypeNotSupported)return 1;
+  if(probe(1280,720)==kSbMediaSupportTypeNotSupported)return 2;
+  if(probe(792,480)==kSbMediaSupportTypeNotSupported)return 3;
+  ytv_media_reject_video_size(1120,720);
+  if(probe(1120,720)!=kSbMediaSupportTypeNotSupported)return 4;
+  if(probe(1280,720)==kSbMediaSupportTypeNotSupported)return 5;
+  return 0;
+}
+#endif
 int SbMediaGetAudioOutputCount(){return 1;}
 bool SbMediaGetAudioConfiguration(int index,SbMediaAudioConfiguration* output){
   if(index!=0 || !output)return false;

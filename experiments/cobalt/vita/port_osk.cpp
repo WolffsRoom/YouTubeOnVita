@@ -35,6 +35,7 @@ extern "C" bool ytv_native_download_set_video(const char* input);
 extern "C" int ytv_native_download_start(bool mp3,int quality);
 extern "C" int ytv_addons_cfg_download_quality();
 extern "C" bool ytv_addons_cfg_download_mp3();
+extern "C" void ytv_ui_sound(int kind); // 16=typing,17=delete
 
 namespace {
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -43,6 +44,7 @@ int g_show_ticket = -1, g_hide_ticket = -1, g_focus_ticket = -1, g_blur_ticket =
 char g_show_text[512];
 bool g_shown = false;      // as far as Cobalt knows
 volatile bool g_ime_running = false;
+int g_ime_last_length=-1; // reset on each new system IME
 int g_native_config_field = -1;  // 0=legacy server, 1=legacy key, 2=native video URL
 
 // IME dialog buffers (UTF-16).
@@ -112,6 +114,7 @@ bool start_ime(const char* initial) {
                 g_native_config_field == 1 ? "Cobalt API key" :
                 g_native_config_field == 2 ? "Video URL" : "YouTube", g_ime_title, 64);
   memset(g_ime_input, 0, sizeof(g_ime_input));
+  g_ime_last_length=-1;
   p.supportedLanguages = 0;  // all
   p.languagesForced = SCE_FALSE;
   p.type = SCE_IME_TYPE_DEFAULT;
@@ -240,6 +243,16 @@ void ytv_osk_tick() {
     send_ticket_event(kSbEventTypeOnScreenKeyboardHidden, hide);
   }
   if (g_ime_running) {
+    // The system IME does not expose per-key callbacks; on the main tick,
+    // compare its live UTF-16 buffer length (only cue, no text logging).
+    // Some Vita firmware updates the buffer only on ENTER, in which case
+    // the cue will play for the confirmed edit, not individual keystrokes.
+    int current_length=0;
+    while(current_length<SCE_IME_DIALOG_MAX_TEXT_LENGTH &&
+          g_ime_input[current_length])++current_length;
+    if(g_ime_last_length>=0 && current_length!=g_ime_last_length)
+      ytv_ui_sound(current_length<g_ime_last_length?17:16);
+    g_ime_last_length=current_length;
     SceCommonDialogStatus st = sceImeDialogGetStatus();
     if (st == SCE_COMMON_DIALOG_STATUS_FINISHED) {
       SceImeDialogResult res;
@@ -266,6 +279,7 @@ void ytv_osk_tick() {
         }
       }
       sceImeDialogTerm();
+      g_ime_last_length=-1;
       g_native_config_field = -1;
       g_ime_running = false;
       if (g_shown) {

@@ -17,6 +17,7 @@
 #include "starboard/audio_sink.h"
 #include <psp2/audioout.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <cstdio>
@@ -30,6 +31,7 @@ struct SbAudioSinkPrivate {
   int port;
   int channels;
   int frames_capacity;
+  int boot_mute_remaining;  // first TV WebAudio jingle only, not custom splash or SbPlayer
   SbMediaAudioSampleType sample_type;
   SbMediaAudioFrameStorageType storage_type;
   SbAudioSinkFrameBuffers source;
@@ -48,6 +50,8 @@ constexpr int kMinBuffer = 16 * kBlock;  // ~170 ms: absorbs CPU stalls on hardw
 constexpr int kMaxSinks = 4;
 constexpr uint32_t kMagic = 0x59544153u;  // "YTAS"
 constexpr int kAudioThreadPriority = 64;  // high (lower value = higher)
+constexpr int kTvBootMuteFrames = 3 * kHz;  // at most 3 seconds of native TV intro
+constexpr uint64_t kTvBootWindowUs = 90ull * 1000000ull;
 
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 // Diagnostic (verbose.txt only): first ~12 s of PCM written to the port,
@@ -71,6 +75,8 @@ void dump_block(const int16_t* pcm, int index) {
   }
 }
 SbAudioSink g_sinks[kMaxSinks] = {};
+bool g_first_tv_sink_seen = false;
+extern "C" bool ytv_native_player_present();
 
 inline int16_t to_s16(float x) {
   if (x > 1.0f) x = 1.0f;
@@ -128,6 +134,17 @@ int audio_thread(SceSize, void* argp) {
     for (int i = 0; i < take; i++) {
       pcm[2 * i] = fetch(s, offset + i, 0);
       pcm[2 * i + 1] = fetch(s, offset + i, 1);
+    }
+    // The custom splash jingle plays separately on a VOICE port. YouTube's
+    // own first WebAudio sink sometimes plays another startup chime AFTER the
+    // profile chooser. Silence only the first 3 seconds of that sink; consume
+    // the frames normally so its clock and buffer ownership remain correct.
+    // Subsequent WebAudio sinks, native Add-ons sounds and SbPlayer audio are
+    // unaffected. This is intentionally bounded, not a global audio mute.
+    if (take > 0 && s->boot_mute_remaining > 0) {
+      int silent = take < s->boot_mute_remaining ? take : s->boot_mute_remaining;
+      memset(pcm, 0, (size_t)silent * 2 * sizeof(int16_t));
+      s->boot_mute_remaining -= silent;
     }
     // Blocks until the previous block has been played: this is the pacing.
     if (take > 0) dump_block(pcm, s->port);
@@ -224,10 +241,22 @@ SbAudioSink SbAudioSinkCreate(int channels, int hz, SbMediaAudioSampleType type,
   sink->magic = kMagic;
   pthread_mutex_lock(&g_lock);
   bool registered = register_sink(sink);
+  // Suppress exactly one early Cobalt WebAudio startup sound. The custom
+  // youtube_intro_audio.pcm is a separate native VOICE port and stays audible.
+  bool mute_tv_boot = false;
+  if (registered && !g_first_tv_sink_seen &&
+      sceKernelGetProcessTimeWide() < kTvBootWindowUs &&
+      !ytv_native_player_present()) {
+    g_first_tv_sink_seen = true;
+    sink->boot_mute_remaining = kTvBootMuteFrames;
+    mute_tv_boot = true;
+  }
   pthread_mutex_unlock(&g_lock);
   if (!registered) {
     free(sink); sceAudioOutReleasePort(port); return kSbAudioSinkInvalid;
   }
+  if (mute_tv_boot)
+    SbLogRaw("YTV_LIFECYCLE_TV_BOOT_WEBAUDIO_MUTED first_3s=1 custom_splash_unchanged=1\n");
   pthread_attr_t attr;
   pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, 0x10000);

@@ -179,13 +179,12 @@ bool ensure_vitagl() {
     const int kRamPool = (ytv_lowmem() ? 24 : 48) * 1024 * 1024;
     int user_free = info.size_user;
     int ram_threshold = user_free > kRamPool ? user_free - kRamPool : 0;
-    // Keep 16 MiB of physically contiguous RAM and 20 MiB of CDRAM for the
-    // H.264 decoder (reference frames + decoded picture pool). On hardware
-    // only ~10 MiB of phycont was actually free and VitaGL took all CDRAM,
-    // so every 480p/720p player failed and YouTube fell back to 360p (and
-    // the sign-in animation video never played). VitaGL takes the rest.
-    // Full HD (Add-ons): the 1920x1088 decoder needs ~2x the video memory.
-    const int cdram_reserve = (ytv_addons_cfg_fhd() && !ytv_lowmem() ? 40 : 20) * 1024 * 1024;
+    // Keep physical memory for the H.264 decoder. After ~10 minutes of
+    // playback the v0.59 Full hardware log showed only 7 MiB of free CDRAM
+    // while VitaGL still had ~40 MiB unused in its own pool; rebalance 8 MiB
+    // towards the decoder/next-video allocations. Do not reduce the already
+    // validated 40 MiB reserve used by the Full HD option.
+    const int cdram_reserve = (ytv_addons_cfg_fhd() && !ytv_lowmem() ? 40 : 28) * 1024 * 1024;
     // VitaGL's per-frame circular vertex pool defaults to 32 MiB taken from
     // its RAM pool, which left that pool ~6.5 MiB free for textures (v0.42
     // log). 12 MiB (4 MiB per frame) is ample for Cobalt; overflows fall back
@@ -195,6 +194,16 @@ bool ensure_vitagl() {
         0x80000, 960, 544, ram_threshold, cdram_reserve, 16 * 1024 * 1024,
         0x7fffffff /* no common-dialog pool, same as vglInitExtended */,
         SCE_GXM_MULTISAMPLE_NONE);
+    // v0.64: GL_DYNAMIC_DRAW / GL_STREAM_DRAW buffers must own real memory.
+    // VitaGL's default ("scratch") places their contents in the per-frame
+    // circular pool, which is handed to another frame 3 swaps later. Any
+    // buffer kept across frames (or updated later with glBufferSubData)
+    // then points at another frame's vertex data: stretched triangles over
+    // thumbnails and text that stay until restart (hardware, lyrics mode
+    // with heavy scrolling, logs-psv\v064-artefatos). Without scratch every
+    // upload is a normal allocation, freed by the GC 4 frames after its last
+    // use, the same path VitaGL uses for static buffers.
+    vglSetupScratchMemory(GL_FALSE, GL_FALSE);
     g_vgl_ready = true;
     SceKernelFreeMemorySizeInfo after = {};
     after.size = sizeof(after);
@@ -603,6 +612,7 @@ void dump_frame(int n) {
 }
 #endif
 extern "C" void ytv_addons_before_swap();
+extern "C" void ytv_addons_after_swap();
 // VitaGL's own pools (sampled on the GL thread once a second; vglMemFree walks
 // VitaGL's heap and must not race with it). When these run dry VitaGL draws
 // with missing vertex data / textures: stretched triangles, missing images.
@@ -664,6 +674,7 @@ EGLBoolean ytv_egl_swap_buffers(EGLDisplay display, EGLSurface surface) {
   // While the Vita IME dialog is open VitaGL must draw the system dialog too.
   if (ytv_osk_active()) vglSwapBuffers(GL_TRUE);
   else ::eglSwapBuffers(display, surface);
+  ytv_addons_after_swap();  // inverted screen: target of the next frame
   ytv_native_startup_splash_release();  // release intro fb AFTER VitaGL swap
   ytv_player_on_swap();  // frees video decode targets the GPU is done with
   g_prof_last_swap_end = sceKernelGetSystemTimeWide();
@@ -809,6 +820,34 @@ constexpr int kMaxRenderbuffers = 256;
 RenderbufferInfo g_rbos[kMaxRenderbuffers] = {};
 GLuint g_bound_rbo = 0;  // GL context is single, so one binding
 pthread_mutex_t g_gl_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// v0.64 inverted screen: while active, Cobalt's default framebuffer (0) is
+// an offscreen framebuffer of the Add-ons layer; the overlay turns it 180
+// degrees onto the real screen at swap time (port_addons.cpp).
+extern "C" unsigned ytv_screen_fbo();
+void ytv_gl_bind_framebuffer(GLenum target, GLuint fb) {
+  if (fb == 0) fb = ytv_screen_fbo();
+  ::glBindFramebuffer(target, fb);
+}
+// vitaGL places the scissor box of a texture framebuffer with the opposite
+// vertical origin from the display (geometry is not affected). Rectangles
+// Skia sets for the default framebuffer are mirrored while that framebuffer
+// is the inverted-screen target.
+inline bool on_screen_fbo() {
+  const GLuint screen = ytv_screen_fbo();
+  if (!screen) return false;
+  GLint bound = 0;
+  ::glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound);
+  return (GLuint)bound == screen;
+}
+void ytv_gl_scissor(GLint x, GLint y, GLsizei w, GLsizei h) {
+  if (on_screen_fbo()) y = 544 - y - h;
+  ::glScissor(x, y, w, h);
+}
+void ytv_gl_viewport(GLint x, GLint y, GLsizei w, GLsizei h) {
+  if (on_screen_fbo()) y = 544 - y - h;
+  ::glViewport(x, y, w, h);
+}
 
 void ytv_gl_bind_renderbuffer(GLenum target, GLuint rbo) {
   ::glBindRenderbuffer(target, rbo);
@@ -1127,6 +1166,12 @@ void ytv_gl_get_integerv(GLenum pname, GLint* data) {
     // exists: report none and let callers compile from source.
     case 0x87FE /*GL_NUM_PROGRAM_BINARY_FORMATS*/: *data = 0; return;
     case 0x87FF /*GL_PROGRAM_BINARY_FORMATS*/: return;
+    case GL_FRAMEBUFFER_BINDING: {  // the inverted-screen target reads as 0
+      ::glGetIntegerv(pname, data);
+      const GLint screen = (GLint)ytv_screen_fbo();
+      if (screen && *data == screen) *data = 0;
+      return;
+    }
     default: ::glGetIntegerv(pname, data);
   }
 }
@@ -1387,10 +1432,10 @@ void t_clear_color(GLfloat r, GLfloat g, GLfloat b, GLfloat a) {
   ::glClearColor(r, g, b, a);
 }
 void t_viewport(GLint x, GLint y, GLsizei w, GLsizei h) {
-  GLT("glViewport %d %d %d %d", x, y, w, h); ::glViewport(x, y, w, h);
+  GLT("glViewport %d %d %d %d", x, y, w, h); ytv_gl_viewport(x, y, w, h);
 }
 void t_scissor(GLint x, GLint y, GLsizei w, GLsizei h) {
-  GLT("glScissor %d %d %d %d", x, y, w, h); ::glScissor(x, y, w, h);
+  GLT("glScissor %d %d %d %d", x, y, w, h); ytv_gl_scissor(x, y, w, h);
 }
 void t_enable(GLenum c) { GLT("glEnable 0x%x", c); ytv_gl_enable(c); }
 void t_disable(GLenum c) { GLT("glDisable 0x%x", c); ytv_gl_disable(c); }
@@ -1444,7 +1489,7 @@ void t_draw_elements(GLenum m, GLsizei c, GLenum t, const void* i) {
   GLT("glDrawElements done err=0x%x", ::glGetError());
 }
 void t_clear(GLbitfield b) { GLT("glClear 0x%x", b); ::glClear(b); GLT("glClear done %d", 0); }
-void t_bind_fb(GLenum t, GLuint f) { GLT("glBindFramebuffer %u", f); ::glBindFramebuffer(t, f); }
+void t_bind_fb(GLenum t, GLuint f) { GLT("glBindFramebuffer %u", f); ytv_gl_bind_framebuffer(t, f); }
 void t_fb_tex(GLenum t, GLenum a, GLenum tt, GLuint tex, GLint l) {
   GLT("glFramebufferTexture2D att=0x%x tex=%u", a, tex);
   ::glFramebufferTexture2D(t, a, tt, tex, l);
@@ -1529,10 +1574,182 @@ void prof_draw_arrays(GLenum m, GLint f, GLsizei c) {
   ::glDrawArrays(m, f, c);
   g_prof_draw_us += prof_now() - t; g_prof_draws++;
 }
+// ---- v0.64: opaque black boxes behind text --------------------------------
+// With the player open (end screen, suggestions, video title) the YouTube
+// page gives each line of text an opaque black background. Cobalt draws them
+// as solid rectangles (its a_position/a_color program, blending off, colour
+// exactly 0,0,0,1, one quad per text line) together with the other opaque
+// rectangles of the frame. Seen in Vita3K: the 960x544 page background, then
+// 12 boxes of 14-21 px height under the titles and metadata lines.
+// Those quads become degenerate triangles before the draw; the text itself
+// (drawn afterwards from Cobalt's text atlas) is untouched. The vertex and
+// index data are read from a CPU copy kept at upload time.
+struct BufCopy { GLuint id; uint8_t* p; size_t n; };
+BufCopy g_buf_copies[64];
+int g_buf_next = 0;
+BufCopy* buf_copy(GLuint id, bool create) {
+  if (!id) return nullptr;
+  for (auto& e : g_buf_copies) if (e.id == id) return &e;
+  if (!create) return nullptr;
+  BufCopy* e = &g_buf_copies[g_buf_next++ % 64];
+  free(e->p);
+  e->id = id; e->p = nullptr; e->n = 0;
+  return e;
+}
+GLuint bound_buffer(GLenum target) {
+  GLint b = 0;
+  ::glGetIntegerv(target == GL_ELEMENT_ARRAY_BUFFER ? GL_ELEMENT_ARRAY_BUFFER_BINDING
+                                                    : GL_ARRAY_BUFFER_BINDING, &b);
+  return (GLuint)b;
+}
+// v0.64 diagnostic: dynamic/stream buffers used again in a later frame. With
+// VitaGL scratch memory (disabled above) exactly these uses read or wrote
+// another frame's data. Logged a few times, so the hardware log shows whether
+// the page does it.
+}  // namespace
+extern "C" uint32_t vgl_framecount;
+namespace {
+struct DynBuf { GLuint id; uint32_t frame; };
+DynBuf g_dyn_bufs[256];
+int g_dyn_logged = 0;
+DynBuf* dyn_buf(GLuint id, bool create) {
+  if (!id) return nullptr;
+  DynBuf* slot = &g_dyn_bufs[(id >> 4) & 255];
+  if (slot->id == id) return slot;
+  if (!create) return nullptr;
+  slot->id = id;
+  return slot;
+}
+void dyn_check(GLuint id, const char* what) {
+  DynBuf* d = dyn_buf(id, false);
+  if (!d || g_dyn_logged >= 6) return;
+  const uint32_t age = vgl_framecount - d->frame;
+  if (age < 3) return;
+  g_dyn_logged++;
+  char line[112];
+  snprintf(line, sizeof(line), "YTV_GL_DYNAMIC_BUFFER_REUSE %s age=%u frames" "\n", what, (unsigned)age);
+  log_line(line);
+}
+void ytv_gl_buffer_data(GLenum target, GLsizeiptr size, const void* data, GLenum usage) {
+  {
+    const GLuint id = bound_buffer(target);
+    if (usage == GL_DYNAMIC_DRAW || usage == GL_STREAM_DRAW) {
+      if (DynBuf* d = dyn_buf(id, true)) d->frame = vgl_framecount;
+    } else if (DynBuf* d = dyn_buf(id, false)) {
+      d->id = 0;
+    }
+  }
+  if (BufCopy* e = buf_copy(bound_buffer(target), true)) {
+    free(e->p);
+    e->p = nullptr; e->n = 0;
+    if (size > 0 && size <= (1 << 20)) {
+      e->p = static_cast<uint8_t*>(malloc((size_t)size));
+      if (e->p) {
+        e->n = (size_t)size;
+        if (data) memcpy(e->p, data, (size_t)size); else memset(e->p, 0, (size_t)size);
+      }
+    }
+  }
+  ::glBufferData(target, size, data, usage);
+}
+void ytv_gl_buffer_sub_data(GLenum target, GLintptr off, GLsizeiptr size, const void* data) {
+  dyn_check(bound_buffer(target), "subdata");
+  BufCopy* e = buf_copy(bound_buffer(target), false);
+  if (e && e->p) {
+    if (data && off >= 0 && (size_t)(off + size) <= e->n) memcpy(e->p + off, data, (size_t)size);
+    else { free(e->p); e->p = nullptr; e->n = 0; }  // copy no longer valid
+  }
+  ::glBufferSubData(target, off, size, data);
+}
+// 0 unknown, 1 Cobalt's solid colour program, 2 anything else.
+uint8_t g_prog_kind[1024];
+GLint g_solid_pos[1024], g_solid_col[1024];
+// Draws without the text-background quads; false = draw normally.
+bool draw_without_text_boxes(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+  if (mode != GL_TRIANGLES || count < 6 || count % 6 || count > 6 * 512 ||
+      type != GL_UNSIGNED_SHORT || ::glIsEnabled(GL_BLEND))
+    return false;
+  GLint pr = 0;
+  ::glGetIntegerv(GL_CURRENT_PROGRAM, &pr);
+  if (pr <= 0 || pr >= 1024) return false;
+  if (!g_prog_kind[pr]) {
+    const GLint lp = ::glGetAttribLocation((GLuint)pr, "a_position");
+    const GLint lc = ::glGetAttribLocation((GLuint)pr, "a_color");
+    const GLint lt = ::glGetAttribLocation((GLuint)pr, "a_texcoord");
+    g_prog_kind[pr] = lp >= 0 && lc >= 0 && lt < 0 ? 1 : 2;
+    g_solid_pos[pr] = lp; g_solid_col[pr] = lc;
+  }
+  if (g_prog_kind[pr] != 1) return false;
+  GLint fb = 0;
+  ::glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+  if (fb != 0 && (GLuint)fb != ytv_screen_fbo()) return false;  // offscreen targets untouched
+  const GLuint lp = (GLuint)g_solid_pos[pr], lc = (GLuint)g_solid_col[pr];
+  GLint pb = 0, ps = 0, pt = 0, pst = 0, cb = 0, cs = 0, ct = 0, cst = 0;
+  void* po = nullptr;
+  void* co = nullptr;
+  ::glGetVertexAttribiv(lp, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &pb);
+  ::glGetVertexAttribiv(lp, GL_VERTEX_ATTRIB_ARRAY_SIZE, &ps);
+  ::glGetVertexAttribiv(lp, GL_VERTEX_ATTRIB_ARRAY_TYPE, &pt);
+  ::glGetVertexAttribiv(lp, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &pst);
+  ::glGetVertexAttribPointerv(lp, GL_VERTEX_ATTRIB_ARRAY_POINTER, &po);
+  ::glGetVertexAttribiv(lc, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &cb);
+  ::glGetVertexAttribiv(lc, GL_VERTEX_ATTRIB_ARRAY_SIZE, &cs);
+  ::glGetVertexAttribiv(lc, GL_VERTEX_ATTRIB_ARRAY_TYPE, &ct);
+  ::glGetVertexAttribiv(lc, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &cst);
+  ::glGetVertexAttribPointerv(lc, GL_VERTEX_ATTRIB_ARRAY_POINTER, &co);
+  if (pt != GL_FLOAT || ps < 2 || ct != GL_UNSIGNED_BYTE || cs != 4) return false;
+  const GLuint eb = bound_buffer(GL_ELEMENT_ARRAY_BUFFER);
+  BufCopy* vc = buf_copy((GLuint)pb, false);
+  BufCopy* cc = buf_copy((GLuint)cb, false);
+  BufCopy* ic = buf_copy(eb, false);
+  if (!vc || !vc->p || !cc || !cc->p || !ic || !ic->p) return false;
+  const size_t ioff = (size_t)(uintptr_t)indices;
+  if (ioff + (size_t)count * 2 > ic->n) return false;
+  const size_t pstride = pst ? (size_t)pst : (size_t)ps * 4, cstride = cst ? (size_t)cst : 4;
+  static uint16_t idx[6 * 512];
+  memcpy(idx, ic->p + ioff, (size_t)count * 2);
+  int removed = 0;
+  for (int q = 0; q < count; q += 6) {
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    bool black = true;
+    for (int k = 0; k < 6 && black; k++) {
+      const size_t vo = (size_t)(uintptr_t)po + idx[q + k] * pstride;
+      const size_t ko = (size_t)(uintptr_t)co + idx[q + k] * cstride;
+      if (vo + 8 > vc->n || ko + 4 > cc->n) return false;
+      float v[2];
+      memcpy(v, vc->p + vo, sizeof(v));
+      const uint8_t* c = cc->p + ko;
+      black = c[0] == 0 && c[1] == 0 && c[2] == 0 && c[3] == 255;
+      x0 = v[0] < x0 ? v[0] : x0; x1 = v[0] > x1 ? v[0] : x1;
+      y0 = v[1] < y0 ? v[1] : y0; y1 = v[1] > y1 ? v[1] : y1;
+    }
+    const float h = y1 - y0, w = x1 - x0;
+    if (black && h >= 8.f && h <= 40.f && w >= 4.f && w <= 900.f) {
+      for (int k = 1; k < 6; k++) idx[q + k] = idx[q];  // degenerate
+      removed++;
+    }
+  }
+  if (!removed) return false;
+  static int logged = 0;
+  if (logged < 3) {
+    logged++;
+    char line[96];
+    snprintf(line, sizeof(line), "YTV_LIFECYCLE_TEXT_BOXES removed=%d of %d quads\n", removed, count / 6);
+    log_line(line);
+  }
+  ::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+  ::glDrawElements(mode, count, type, idx);
+  ::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, eb);
+  return true;
+}
 void prof_draw_elements(GLenum m, GLsizei c, GLenum ty, const void* i) {
   uint64_t t = prof_now(); prof_frame_mark(t); g_hb_draws++;
   if (g_startup_bg_active) ++g_startup_draws;
-  ::glDrawElements(m, c, ty, i);
+  if (g_dyn_logged < 6) {
+    dyn_check(bound_buffer(GL_ELEMENT_ARRAY_BUFFER), "draw_indices");
+    dyn_check(bound_buffer(GL_ARRAY_BUFFER), "draw_vertices");
+  }
+  if (!draw_without_text_boxes(m, c, ty, i)) ::glDrawElements(m, c, ty, i);
   g_prof_draw_us += prof_now() - t; g_prof_draws++;
 }
 SbEglInterface egl_api = {};
@@ -1578,7 +1795,7 @@ void install_checked_gl() {
   CHECKED(::glAttachShader)::name = "glAttachShader"; SET_GL(glAttachShader, &CHECKED(::glAttachShader)::call);
   CHECKED(::glBindAttribLocation)::name = "glBindAttribLocation"; SET_GL(glBindAttribLocation, &CHECKED(::glBindAttribLocation)::call);
   CHECKED(::glBindBuffer)::name = "glBindBuffer"; SET_GL(glBindBuffer, &CHECKED(::glBindBuffer)::call);
-  CHECKED(::glBindFramebuffer)::name = "glBindFramebuffer"; SET_GL(glBindFramebuffer, &CHECKED(::glBindFramebuffer)::call);
+  CHECKED(ytv_gl_bind_framebuffer)::name = "glBindFramebuffer"; SET_GL(glBindFramebuffer, &CHECKED(ytv_gl_bind_framebuffer)::call);
   CHECKED(ytv_gl_bind_renderbuffer)::name = "glBindRenderbuffer"; SET_GL(glBindRenderbuffer, &CHECKED(ytv_gl_bind_renderbuffer)::call);
   CHECKED(::glBindTexture)::name = "glBindTexture"; SET_GL(glBindTexture, &CHECKED(::glBindTexture)::call);
   CHECKED(::glBlendEquation)::name = "glBlendEquation"; SET_GL(glBlendEquation, &CHECKED(::glBlendEquation)::call);
@@ -1657,7 +1874,7 @@ void install_checked_gl() {
   CHECKED(ytv_gl_read_pixels)::name = "glReadPixels"; SET_GL(glReadPixels, &CHECKED(ytv_gl_read_pixels)::call);
   CHECKED(::glReleaseShaderCompiler)::name = "glReleaseShaderCompiler"; SET_GL(glReleaseShaderCompiler, &CHECKED(::glReleaseShaderCompiler)::call);
   CHECKED(ytv_gl_renderbuffer_storage)::name = "glRenderbufferStorage"; SET_GL(glRenderbufferStorage, &CHECKED(ytv_gl_renderbuffer_storage)::call);
-  CHECKED(::glScissor)::name = "glScissor"; SET_GL(glScissor, &CHECKED(::glScissor)::call);
+  CHECKED(ytv_gl_scissor)::name = "glScissor"; SET_GL(glScissor, &CHECKED(ytv_gl_scissor)::call);
   CHECKED(::glShaderBinary)::name = "glShaderBinary"; SET_GL(glShaderBinary, &CHECKED(::glShaderBinary)::call);
   CHECKED(ytv_gl_shader_source)::name = "glShaderSource"; SET_GL(glShaderSource, &CHECKED(ytv_gl_shader_source)::call);
   CHECKED(::glStencilFunc)::name = "glStencilFunc"; SET_GL(glStencilFunc, &CHECKED(::glStencilFunc)::call);
@@ -1700,7 +1917,7 @@ void install_checked_gl() {
   CHECKED(::glVertexAttrib4f)::name = "glVertexAttrib4f"; SET_GL(glVertexAttrib4f, &CHECKED(::glVertexAttrib4f)::call);
   CHECKED(::glVertexAttrib4fv)::name = "glVertexAttrib4fv"; SET_GL(glVertexAttrib4fv, &CHECKED(::glVertexAttrib4fv)::call);
   CHECKED(::glVertexAttribPointer)::name = "glVertexAttribPointer"; SET_GL(glVertexAttribPointer, &CHECKED(::glVertexAttribPointer)::call);
-  CHECKED(::glViewport)::name = "glViewport"; SET_GL(glViewport, &CHECKED(::glViewport)::call);
+  CHECKED(ytv_gl_viewport)::name = "glViewport"; SET_GL(glViewport, &CHECKED(ytv_gl_viewport)::call);
   CHECKED(::glReadBuffer)::name = "glReadBuffer"; SET_GL(glReadBuffer, &CHECKED(::glReadBuffer)::call);
   CHECKED(::glDrawRangeElements)::name = "glDrawRangeElements"; SET_GL(glDrawRangeElements, &CHECKED(::glDrawRangeElements)::call);
   CHECKED(::glGenQueries)::name = "glGenQueries"; SET_GL(glGenQueries, &CHECKED(::glGenQueries)::call);
@@ -1796,15 +2013,15 @@ void set_interfaces() {
   SET_GL(glAttachShader, &::glAttachShader);
   SET_GL(glBindAttribLocation, &::glBindAttribLocation);
   SET_GL(glBindBuffer, &::glBindBuffer);
-  SET_GL(glBindFramebuffer, &::glBindFramebuffer);
+  SET_GL(glBindFramebuffer, &ytv_gl_bind_framebuffer);
   SET_GL(glBindRenderbuffer, &ytv_gl_bind_renderbuffer);
   SET_GL(glBindTexture, &::glBindTexture);
   SET_GL(glBlendEquation, &::glBlendEquation);
   SET_GL(glBlendEquationSeparate, &::glBlendEquationSeparate);
   SET_GL(glBlendFunc, &::glBlendFunc);
   SET_GL(glBlendFuncSeparate, &::glBlendFuncSeparate);
-  SET_GL(glBufferData, &::glBufferData);
-  SET_GL(glBufferSubData, &::glBufferSubData);
+  SET_GL(glBufferData, &ytv_gl_buffer_data);
+  SET_GL(glBufferSubData, &ytv_gl_buffer_sub_data);
   SET_GL(glCheckFramebufferStatus, &diag_check_fb);
   SET_GL(glClear, &::glClear);
   SET_GL(glClearColor, &::glClearColor);
@@ -1876,7 +2093,7 @@ void set_interfaces() {
   SET_GL(glReadPixels, &ytv_gl_read_pixels);
   SET_GL(glReleaseShaderCompiler, &::glReleaseShaderCompiler);
   SET_GL(glRenderbufferStorage, &ytv_gl_renderbuffer_storage);
-  SET_GL(glScissor, &::glScissor);
+  SET_GL(glScissor, &ytv_gl_scissor);
   SET_GL(glShaderBinary, &::glShaderBinary);
   SET_GL(glShaderSource, &ytv_gl_shader_source);
   SET_GL(glStencilFunc, &::glStencilFunc);
@@ -1919,7 +2136,7 @@ void set_interfaces() {
   SET_GL(glVertexAttrib4f, &::glVertexAttrib4f);
   SET_GL(glVertexAttrib4fv, &::glVertexAttrib4fv);
   SET_GL(glVertexAttribPointer, &::glVertexAttribPointer);
-  SET_GL(glViewport, &::glViewport);
+  SET_GL(glViewport, &ytv_gl_viewport);
   SET_GL(glReadBuffer, &::glReadBuffer);
   SET_GL(glDrawRangeElements, &::glDrawRangeElements);
   SET_GL(glGenQueries, &::glGenQueries);

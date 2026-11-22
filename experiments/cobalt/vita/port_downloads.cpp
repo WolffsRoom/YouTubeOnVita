@@ -330,9 +330,11 @@ void run_download() {
   curl_global_cleanup();
 }
 void* worker(void*) {
-  SbLogRaw("YTV_DOWNLOAD_WORKER_ENTER\n");
+  // Optional server-backed downloads are always background jobs.
+  sceKernelChangeThreadPriority(0,180);
+  SbLogRaw("YTV_LIFECYCLE_DOWNLOAD_WORKER_ENTER\n");
   run_download();
-  SbLogRaw("YTV_DOWNLOAD_WORKER_EXIT\n");
+  SbLogRaw("YTV_LIFECYCLE_DOWNLOAD_WORKER_EXIT\n");
   pthread_mutex_lock(&s_lock);
   s_running = 0;
   pthread_mutex_unlock(&s_lock);

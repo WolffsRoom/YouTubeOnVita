@@ -123,10 +123,19 @@ bool registry_take(void* p, bool remove) {
   return false;
 }
 pthread_once_t g_heap_once = PTHREAD_ONCE_INIT;
+// g_large_on: the heap range is known, so large blocks can be told apart.
+// g_large_first: Lite sends every large block to its own memblock. Full
+// (v0.65) only does so when the newlib heap cannot satisfy the request:
+// switching 720p -> 480p -> 720p on hardware failed a 2.1 MiB allocation with
+// 57 MiB of the 112 MiB heap in use (fragmentation) and Cobalt copied into
+// the NULL it got back (logs-psv\v064, pc=cobalt+0x1729e88 in memcpy), while
+// ~80 MiB of user memory outside the heap was free.
 bool g_large_on = false;
+bool g_large_first = false;
+volatile int g_large_rescues = 0;
 void heap_range_once() {
-  g_large_on = ytv_lowmem && ytv_lowmem();
-  if (!g_large_on) return;
+  g_large_first = ytv_lowmem && ytv_lowmem();
+  g_large_on = true;
   void* probe = malloc(16);
   SceKernelMemBlockInfo info;
   memset(&info, 0, sizeof(info));
@@ -139,11 +148,17 @@ void heap_range_once() {
   }
   free(probe);
   char line[120];
-  snprintf(line, sizeof(line), "YTV_LIFECYCLE_LARGE_ALLOC on=%d heap=%p-%p\n", g_large_on ? 1 : 0,
-           (void*)g_heap_lo, (void*)g_heap_hi);
+  snprintf(line, sizeof(line), "YTV_LIFECYCLE_LARGE_ALLOC on=%d first=%d heap=%p-%p\n",
+           g_large_on ? 1 : 0, g_large_first ? 1 : 0, (void*)g_heap_lo, (void*)g_heap_hi);
   SbLogRaw(line);
 }
+// Large blocks go to their own memblock before trying the heap (Lite).
 inline bool large_enabled() {
+  pthread_once(&g_heap_once, heap_range_once);
+  return g_large_on && g_large_first;
+}
+// Large blocks may use their own memblock when the heap failed (both builds).
+inline bool large_fallback() {
   pthread_once(&g_heap_once, heap_range_once);
   return g_large_on;
 }
@@ -174,6 +189,16 @@ void* large_alloc(size_t size) {
   }
   return p;
 }
+void* large_rescue(size_t size, const char* what) {
+  void* p = large_alloc(size);
+  if (__sync_fetch_and_add(&g_large_rescues, 1) < 8) {
+    char line[128];
+    snprintf(line, sizeof(line), "YTV_LIFECYCLE_ALLOC_RESCUE %s size=%u ok=%d newlib_used=%d\n", what,
+             (unsigned)size, p ? 1 : 0, (int)mallinfo().uordblks);
+    SbLogRaw(line);
+  }
+  return p;
+}
 LargeHeader* large_header(void* p) {
   LargeHeader* h = (LargeHeader*)((char*)p - kLargeHeader);
   return h->magic == kLargeMagic ? h : nullptr;
@@ -192,7 +217,9 @@ void* SbMemoryAllocateUnchecked(size_t size) {
   if (size >= kLargeAlloc && large_enabled()) {
     if (void* p = large_alloc(size)) return p;
   }
-  return malloc(size);
+  void* p = malloc(size);
+  if (!p && size >= kLargeAlloc && large_fallback()) p = large_rescue(size, "allocate");
+  return p;
 }
 void SbMemoryFree(void* memory) {
   if (is_large(memory)) { large_free(memory); return; }
@@ -222,14 +249,27 @@ void* SbMemoryReallocateUnchecked(void* memory, size_t size) {
       return n;
     }
   }
-  return realloc(memory, size);
+  void* r = realloc(memory, size);
+  if (!r && size >= kLargeAlloc && large_fallback()) {
+    // realloc failed and left memory untouched: move it to a memblock.
+    if (void* n = large_rescue(size, "reallocate")) {
+      size_t old = malloc_usable_size(memory);
+      memcpy(n, memory, old < size ? old : size);
+      free(memory);
+      return n;
+    }
+  }
+  return r;
 }
 void* SbMemoryAllocateAlignedUnchecked(size_t alignment, size_t size) {
   // Large blocks are 64-byte aligned (memblock base + 64-byte header).
   if (size >= kLargeAlloc && alignment <= kLargeHeader && large_enabled()) {
     if (void* p = large_alloc(size)) return p;
   }
-  return memalign(alignment, size);
+  void* p = memalign(alignment, size);
+  if (!p && size >= kLargeAlloc && alignment <= kLargeHeader && large_fallback())
+    p = large_rescue(size, "allocate_aligned");
+  return p;
 }
 void SbMemoryFreeAligned(void* memory) { SbMemoryFree(memory); }
 

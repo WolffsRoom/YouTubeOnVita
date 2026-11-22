@@ -167,6 +167,28 @@ bool read_at(SceUID f,uint64_t pos,void*dst,size_t bytes){
 }
 } // namespace
 
+// Reuse the proven file-based parser's MP4 audio sample-table walker
+// on the in-memory moov box, for the streaming progressive MP4 path.
+bool ytv_mp4_parse_audio_moov(const uint8_t* raw,size_t bytes,
+                              uint64_t max_file_bytes,YtvMp4Audio& out){
+  out=YtvMp4Audio();
+  if(!raw || bytes<8 || bytes>8*1024*1024 ||
+     max_file_bytes<bytes)return false;
+  std::vector<uint8_t> buffer(raw,raw+bytes);
+  Box moov;
+  if(!box_at(buffer.data(),0,buffer.size(),moov) ||
+     moov.type!=cc('m','o','o','v'))return false;
+  size_t pos=moov.data;
+  while(pos+8<=moov.end){
+    Box item;
+    if(!box_at(buffer.data(),pos,moov.end,item))return false;
+    if(item.type==cc('t','r','a','k') &&
+       parse_track(buffer,item,max_file_bytes,out))return true;
+    pos=item.end;
+  }
+  return false;
+}
+
 bool ytv_mp4_parse_audio(SceUID file,YtvMp4Audio&out){
   out=YtvMp4Audio();
   const SceOff total=sceIoLseek(file,0,SCE_SEEK_END);

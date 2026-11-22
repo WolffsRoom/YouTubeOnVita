@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <pthread.h>
 #include <cstdint>
 #include <ctime>
 #include "starboard/event.h"
@@ -43,6 +44,7 @@
 #include "starboard/window.h"
 #include "addon_font.h"
 #include "addon_font_bold.h"
+#include "port_download_entries.h"
 
 extern "C" void ytv_vita_lifecycle_send(SbEventType type, void* data);
 extern "C" SbWindow ytv_vita_current_window();
@@ -60,6 +62,7 @@ extern "C" bool ytv_native_download_running();
 extern "C" void ytv_native_download_get_status(char*,size_t);
 extern "C" bool ytv_native_player_present();
 extern "C" void ytv_ui_sound_enable(bool on);  // port_ui_sound.cpp
+extern "C" void ytv_ui_sound_set_volume(int pct);
 extern "C" volatile int g_ytv_graphics_ext_active; // port_system.cpp
 extern "C" void ytv_ui_sound(int kind);
 extern volatile int g_ytv_hud_video_h;             // port_player.cpp
@@ -67,17 +70,43 @@ extern "C" volatile size_t g_vgl_free_vram, g_vgl_free_ram, g_vgl_free_phy;  // 
 extern volatile unsigned g_ytv_hud_dropped_total;  // port_player.cpp
 // Read atomically in the Starboard DNS worker threads.
 extern "C" { int g_ytv_adblock_enabled = 0; }
+// Video decoder texture sampler only. 1=legacy bilinear, 0=nearest/clearer.
+extern "C" { volatile int g_ytv_video_bilinear_enabled = 1; }
+extern "C" { volatile int g_ytv_video_aspect_mode = 0; }
+// v0.64 Vertical mode for portrait videos (Shorts): 0 off, 1 turn right
+// (clockwise), 2 turn left. Applied by port_player.cpp to new frames.
+extern "C" { volatile int g_ytv_video_vertical_mode = 0; }
+// v0.64 inverted screen (whole interface turned 180 degrees). Settings page.
+extern "C" { volatile int g_ytv_screen_flip = 0; }
+extern "C" { volatile int g_ytv_media_volume_pct=100; }
+extern "C" bool SbSystemNetworkIsDisconnected();
+extern "C" int ytv_network_platform_error_pending();
+extern "C" unsigned ytv_network_platform_error_generation();
+extern "C" int ytv_network_platform_error_retry();
+#if defined(YTV_NATIVE_DOWNLOAD_TEST)
+extern "C" int ytv_metadata_selftest();
+extern "C" int ytv_download_quality_selftest();
+extern "C" int ytv_media_size_selftest();
+#endif
 
 namespace {
 
 constexpr int kScreenW = 960, kScreenH = 544;
 constexpr int kPanelW = 520, kPanelH = 520;
 constexpr int kToastH = 52;
+// 50% black backdrop to distinguish the Add-ons menu from the underlying TV image.
+constexpr float kMenuBackdropOpacity = 0.50f;
 
 // Native pages instead of modifying the proprietary YouTube TV DOM.
-enum Page { kPageNone, kPageHome, kPagePlayer, kPageSettings, kPageDisplay, kPageDownload };
+enum Page { kPageNone, kPageHome, kPagePlayer, kPageSettings,
+            kPageDisplay, kPageDownload, kPageDownloads, kPageNetwork };
 Page g_page = kPageNone;
 Page g_player_return = kPageHome;
+Page g_downloads_return = kPageHome;
+bool g_network_offline=false, g_network_seen_offline=false;
+bool g_network_auto_retry_done=false;
+uint64_t g_network_online_since=0, g_network_next_prompt=0, g_network_last_check=0;
+unsigned g_network_error_seen=0;
 int g_quality_idx = 1;            // 360, 480, 720
 bool g_audio_only = false;         // MP4 by default
 int g_language_pref = 0;           // 0=system, 1=PT, 2=English
@@ -85,13 +114,15 @@ bool g_system_pt = false;
 // Screen and info page.
 const int kDimLevels[] = {0, 20, 35, 50, 65, 80, 90};
 constexpr int kDimChoices = sizeof(kDimLevels) / sizeof(kDimLevels[0]);
+uint64_t g_media_cfg_dirty_since=0;
 int g_dim_idx = 0;          // internal darkening, independent of the backlight
 bool g_perf_hud = false;    // FPS / memory / video info in a corner
 bool g_clock_hud = false;   // clock and battery in a corner
 bool g_ui_sound = true;     // original, gentle navigation cues ON by default
+int g_ui_volume = 70;       // percent; persistent UI audio volume
 bool g_fhd_cfg = false;     // Full HD choice (takes effect when the app starts)
 bool g_fhd_boot = false;    // what this run started with
-const int kTimerMinutes[] = {0, 15, 30, 45, 60, 90, 120};
+const int kTimerMinutes[] = {0, 5, 15, 30, 45, 60, 90, 120};
 constexpr int kTimerChoices = sizeof(kTimerMinutes) / sizeof(kTimerMinutes[0]);
 
 // Shared state. Written by the main (input) thread, read by the renderer
@@ -102,6 +133,16 @@ volatile int g_toast_until_ms = 0;  // toast visible while now_ms < this
 int g_sel = 0;
 int g_timer_idx = 0;
 uint64_t g_timer_deadline_us = 0;
+bool g_timer_announce_pending=false;
+bool g_timer_final_alert_played=false;
+volatile bool g_timer_countdown_visible=false;
+volatile unsigned g_downloads_completed=0;
+volatile int g_mp4_fallback_requested=0;
+volatile int g_mp4_fallback_actual=0;
+volatile unsigned g_mp4_fallback_serial=0;
+unsigned g_mp4_fallback_displayed=0;
+unsigned g_downloads_completed_notified=0;
+bool g_battery_warned=false, g_battery_pending=false;
 bool g_screen_off = false;
 bool g_shot_pending = false;
 uint64_t g_shot_at_us = 0;
@@ -111,6 +152,10 @@ bool g_lr_enabled = true;     // L/R reach YouTube (saved in addons.cfg)
 constexpr const char* kAddonCfg = "ux0:data/youtubevita/addons.cfg";
 bool g_pt = false;  // Portuguese UI (system or user preference)
 
+// The native input thread composes UI while EGL uploads it. Serializing the
+// CPU panel/HUD image with GL texture uploads prevents partially rendered
+// rows from flashing on every menu navigation/volume change.
+pthread_mutex_t g_overlay_image_lock = PTHREAD_MUTEX_INITIALIZER;
 // Current overlay image (panel or toast).
 uint8_t* g_img = nullptr;  // kPanelW*kPanelH*4, top row first
 volatile int g_img_w = 0, g_img_h = 0;
@@ -130,7 +175,8 @@ void* g_painted_base = nullptr;
 uint32_t g_painted_gen = 0;
 int g_painted_x = 0, g_painted_y = 0, g_painted_w = 0, g_painted_h = 0;
 uint64_t g_painted_after_swap = 0;
-uint8_t* g_backup = nullptr;  // pixels under the painted panel
+uint8_t* g_backup = nullptr;  // saved original pixels under idle overlay
+size_t g_backup_capacity = 0;
 
 uint64_t now_us() { return sceKernelGetSystemTimeWide(); }
 
@@ -361,28 +407,89 @@ void timer_value(char* out, size_t n) {
   }
 }
 
+// Snapshot only when opened/refreshed: never do disk I/O during a frame.
+constexpr int kDownloadsVisible=5;
+YtvDownloadEntry g_download_items[48]={};
+char g_download_labels[kDownloadsVisible][88]={};
+int g_download_count=0, g_download_first=0;
+unsigned g_download_seen_revision=0;
+int download_visible(){
+  const int n=g_download_count-g_download_first;
+  return n<=0?0:(n<kDownloadsVisible?n:kDownloadsVisible);
+}
+void refresh_download_list(){
+  const unsigned version=ytv_native_download_revision();
+  g_download_count=ytv_native_download_entries(g_download_items,48);
+  g_download_seen_revision=version;
+  if(g_download_count<0)g_download_count=0;
+  if(g_download_first>=g_download_count)g_download_first=0;
+  char log[96];snprintf(log,sizeof(log),"YTV_LIFECYCLE_ADDON downloads_list=%d\n",g_download_count);
+  log_line(log);
+}
+const char* download_row_label(int row){
+  if(row<0 || row>=download_visible())return "";
+  const YtvDownloadEntry& e=g_download_items[g_download_first+row];
+  const char* prefix=e.state==1?T("Active: ","Baixando: "):
+                     e.state==2?T("Queued: ","Na fila: "):"";
+  char* dest=g_download_labels[row];
+  const size_t width=32;
+  snprintf(dest,88,"%s",prefix);
+  size_t used=strlen(dest);
+  const unsigned char* u=(const unsigned char*)e.name;
+  while(*u && used<width) {
+    const size_t step=(*u<0x80)?1:((*u&0xe0)==0xc0?2:((*u&0xf0)==0xe0?3:4));
+    if(used+step>width || strlen((const char*)u)<step)break;
+    memcpy(dest+used,u,step);used+=step;u+=step;dest[used]=0;
+  }
+  if(*u)strncat(dest,"...",87-strlen(dest));
+  return dest;
+}
 constexpr int kRowY0 = 62, kRowH = 42, kRowX0 = 14;
 constexpr const char* kQualities[] = {"360p", "480p", "720p"};
 constexpr const char* kQualityValues[] = {"360", "480", "720"};
 
 int page_count() {
-  if (g_page == kPagePlayer) return 6;
-  if (g_page == kPageDownload) return 4;
-  if (g_page == kPageSettings) return 7;
-  if (g_page == kPageDisplay) return 5;
-  return 5;
+  if (g_page == kPageNetwork) return 3;
+  if (g_page == kPagePlayer) return 9;
+  if (g_page == kPageDownload) return 5;
+  if (g_page == kPageDownloads) return download_visible()+2;
+  if (g_page == kPageSettings) return 8;
+  if (g_page == kPageDisplay) return 6;
+  return 6;
 }
-int panel_height() { return kRowY0 + page_count() * kRowH + 64; }
+constexpr int kVolumeRowExtra=24;
+int row_y(int i){
+  return kRowY0+i*kRowH+(g_page==kPageDisplay && i>=5?kVolumeRowExtra:0);
+}
+int row_h(int i){
+  return kRowH+(g_page==kPageDisplay && i==4?kVolumeRowExtra:0);
+}
+int panel_height(){
+  return kRowY0+page_count()*kRowH+
+         (g_page==kPageDisplay?kVolumeRowExtra:0)+64;
+}
 const char* menu_title() {
   switch (g_page) {
+    case kPageNetwork:
+      return g_network_offline ? T("No internet", "Sem internet")
+                               : T("Connection error", "Erro de conexão");
     case kPagePlayer: return T("Player settings", "Configurações do player");
     case kPageDownload: return T("Download", "Baixar");
+    case kPageDownloads: return "Downloads";
     case kPageSettings: return T("Settings", "Configurações");
     case kPageDisplay: return T("Screen and info", "Tela e informações");
     default: return "Youtube on Vita";
   }
 }
 const char* item_text(int i) {
+  if (g_page == kPageNetwork) {
+    const char* options[] = {
+      T("Try again", "Tentar novamente"),
+      T("Network settings", "Configurações de rede"),
+      T("Back", "Voltar")
+    };
+    return options[i];
+  }
   if (g_page == kPagePlayer) {
     const char* labels[] = {
       T("Download", "Baixar"),
@@ -390,6 +497,9 @@ const char* item_text(int i) {
       T("Sleep timer", "Timer para pausar"),
       T("Black Screen", "Tela preta"),
       T("Darken Screen", "Escurecer tela"),
+      T("Video filtering", "Filtro de vídeo"),
+      T("Aspect Ratio", "Proporção da imagem"),
+      T("Vertical (Shorts)", "Vertical (Shorts)"),
       T("Back", "Voltar"),
     };
     return labels[i];
@@ -398,10 +508,21 @@ const char* item_text(int i) {
     const char* labels[] = {
       T("Video (MP4)", "Vídeo (MP4)"),
       T("Audio (MP3)", "Áudio (MP3)"),
+      T("View downloads", "Ver downloads"),
       T("Cancel current download", "Cancelar download atual"),
       T("Back", "Voltar"),
     };
     return labels[i];
+  }
+  if (g_page == kPageDownloads) {
+    const int n=download_visible();
+    if(i<n)return download_row_label(i);
+    if(i==n) {
+      if(g_download_count<=kDownloadsVisible)return T("Refresh list", "Atualizar lista");
+      return g_download_first+kDownloadsVisible<g_download_count
+          ? T("View more", "Ver mais") : T("First page", "Início da lista");
+    }
+    return T("Back", "Voltar");
   }
   if (g_page == kPageSettings) {
     const char* labels[] = {
@@ -411,6 +532,7 @@ const char* item_text(int i) {
       T("L / R buttons", "Botões L / R"),
       T("Lock input", "Bloquear entrada"),
       T("Language", "Idioma"),
+      T("Inverted screen", "Tela invertida"),
       T("Back", "Voltar"),
     };
     return labels[i];
@@ -421,12 +543,14 @@ const char* item_text(int i) {
       T("Performance", "Desempenho"),
       T("Clock and battery", "Relógio e bateria"),
       T("Navigation sounds", "Sons de navegação"),
+      T("UI sounds volume", "Volume dos sons"),
       T("Back", "Voltar"),
     };
     return labels[i];
   }
   const char* labels[] = {
     T("Player settings", "Configurações do player"),
+    T("Downloads", "Downloads"),
     T("Settings", "Configurações"),
     T("Screen and info", "Tela e informações"),
     T("Vita Settings", "Configurações do Vita"),
@@ -435,17 +559,28 @@ const char* item_text(int i) {
   return labels[i];
 }
 void icon_item(const Canvas& c, int i, float x, float y, uint32_t col, uint32_t bg) {
-  if (g_page == kPagePlayer) {
+  if(g_page == kPageNetwork){
+    if(i==0)icon_timer(c,x,y,col);
+    else if(i==1)icon_gear(c,x,y,col,bg);
+    else icon_close(c,x,y,col);
+  } else if (g_page == kPagePlayer) {
     switch(i) {
       case 0: icon_download(c,x,y,col); break;
       case 1: icon_camera(c,x,y,col,bg); break;
       case 2: icon_timer(c,x,y,col); break;
       case 3: icon_screen_off(c,x,y,col,bg); break;
       case 4: icon_sun(c,x,y,col); break;
+      case 5: icon_screen_off(c,x,y,col,bg); break;
+      case 6: icon_screen_off(c,x,y,col,bg); break;
+      case 7: icon_screen_off(c,x,y,col,bg); break;
       default: icon_close(c,x,y,col); break;
     }
   } else if (g_page == kPageDownload) {
-    if(i<2) icon_download(c,x,y,col);
+    if(i<3) icon_download(c,x,y,col);
+    else icon_close(c,x,y,col);
+  } else if (g_page == kPageDownloads) {
+    if(i<download_visible()) icon_download(c,x,y,col);
+    else if(i==download_visible()) icon_timer(c,x,y,col);
     else icon_close(c,x,y,col);
   } else if (g_page == kPageSettings) {
     switch(i) {
@@ -455,6 +590,7 @@ void icon_item(const Canvas& c, int i, float x, float y, uint32_t col, uint32_t 
       case 4: icon_lock(c,x,y,col,bg); break;
       case 3: icon_lr(c,x,y,col,bg); break;
       case 5: icon_timer(c,x,y,col); break;
+      case 6: icon_screen_off(c,x,y,col,bg); break;
       default: icon_close(c,x,y,col); break;
     }
   } else if (g_page == kPageDisplay) {
@@ -463,23 +599,41 @@ void icon_item(const Canvas& c, int i, float x, float y, uint32_t col, uint32_t 
       case 1: icon_chart(c,x,y,col); break;
       case 2: icon_timer(c,x,y,col); break;
       case 3: icon_lr(c,x,y,col,bg); break;
+      case 4: icon_lr(c,x,y,col,bg); break;
       default: icon_close(c,x,y,col); break;
     }
   } else {
     if (i == 0) icon_screen_off(c,x,y,col,bg);
-    else if (i == 1) icon_lr(c,x,y,col,bg);
-    else if (i == 2) icon_sun(c,x,y,col);
-    else if (i == 3) icon_gear(c,x,y,col,bg);
+    else if (i == 1) icon_download(c,x,y,col);
+    else if (i == 2) icon_lr(c,x,y,col,bg);
+    else if (i == 3) icon_sun(c,x,y,col);
+    else if (i == 4) icon_gear(c,x,y,col,bg);
     else icon_close(c,x,y,col);
   }
 }
 const char* item_value(int i, const char* timer, char* scratch, size_t capacity) {
+  if(g_page == kPageNetwork && i==0)
+    return g_network_offline ? T("Offline","Offline") : T("Connected","Conectado");
   if (g_page == kPagePlayer) {
     if (i == 0) {
       ytv_native_download_get_status(scratch,capacity);
       return scratch;
     }
     if (i == 2) return timer;
+    if (i == 7) {
+      const int mode=__atomic_load_n(&g_ytv_video_vertical_mode,__ATOMIC_RELAXED);
+      if(mode==1)return T("Turn right","Girar à direita");
+      if(mode==2)return T("Turn left","Girar à esquerda");
+      return T("Off","Desligado");
+    }
+    if (i == 6) {
+      const int mode=__atomic_load_n(&g_ytv_video_aspect_mode,__ATOMIC_RELAXED);
+      if(mode==1)return "Zoom";
+      if(mode==2)return T("Stretch","Esticar");
+      return T("Original","Original");
+    }
+    if (i == 5) return __atomic_load_n(&g_ytv_video_bilinear_enabled,__ATOMIC_RELAXED)
+                         ? "Bilinear" : "Nearest";
     if (i == 4) {
       if (!kDimLevels[g_dim_idx]) return T("Off","Desligado");
       snprintf(scratch,capacity,"%d%%",kDimLevels[g_dim_idx]);
@@ -490,6 +644,22 @@ const char* item_value(int i, const char* timer, char* scratch, size_t capacity)
     if(i==0) return kQualities[g_quality_idx];
     if(i==1) return "160 kbps";
   }
+  if(g_page==kPageDownloads && i==download_visible() &&
+      g_download_count>kDownloadsVisible){
+    snprintf(scratch,capacity,"%d/%d",
+      g_download_first/kDownloadsVisible+1,
+      (g_download_count+kDownloadsVisible-1)/kDownloadsVisible);
+    return scratch;
+  }
+  if(g_page==kPageDownloads && i<download_visible()){
+    const YtvDownloadEntry& e=g_download_items[g_download_first+i];
+    if(e.state==1){
+      ytv_native_download_get_status(scratch,capacity);
+      return scratch;
+    }
+    snprintf(scratch,capacity,"%s",e.state==2?T("Waiting","Aguardando"):e.detail);
+    return scratch;
+  }
   if (g_page == kPageSettings) {
     switch(i) {
       case 0: return __atomic_load_n(&g_ytv_adblock_enabled,__ATOMIC_RELAXED) ? T("On","Ligado") : T("Off","Desligado");
@@ -497,6 +667,7 @@ const char* item_value(int i, const char* timer, char* scratch, size_t capacity)
       case 2: return g_audio_only ? "MP3" : "MP4";
       case 3: return g_lr_enabled ? T("On","Ligados") : T("Off","Desligados");
       case 5: return g_language_pref == 0 ? T("System","Sistema") : (g_language_pref == 1 ? "PT-BR" : "English");
+      case 6: return __atomic_load_n(&g_ytv_screen_flip,__ATOMIC_RELAXED) ? T("On","Ligada") : T("Off","Desligada");
     }
   }
   if (g_page == kPageDisplay) {
@@ -507,11 +678,15 @@ const char* item_value(int i, const char* timer, char* scratch, size_t capacity)
       case 1: return g_perf_hud ? T("On","Ligado") : T("Off","Desligado");
       case 2: return g_clock_hud ? T("On","Ligado") : T("Off","Desligado");
       case 3: return g_ui_sound ? T("On","Ligado") : T("Off","Desligado");
+      case 4:
+        snprintf(scratch,capacity,"%d%%",g_ui_volume);
+        return scratch;
     }
   }
   return nullptr;
 }
 void compose_panel() {
+  pthread_mutex_lock(&g_overlay_image_lock);
   const int h = panel_height();
   Canvas c = {g_img, kPanelW, h};
   base_panel(c, kBg, 16);
@@ -530,22 +705,41 @@ void compose_panel() {
     else snprintf(right,sizeof(right),"%02d:%02d",(int)t.hour,(int)t.minute);
     draw_text(c,kPanelW-22-text_width(right),15,right,kTextDim);
   }
+  // No revision/subtitle below the YouTube on Vita heading.
+  if(g_page==kPageNetwork){
+    draw_text(c,25,40,g_network_offline ?
+        T("Check Wi-Fi or Airplane mode", "Verifique Wi-Fi ou Modo avião") :
+        T("Wi-Fi detected. Retry YouTube", "Wi-Fi detectado. Tente novamente"),
+        kTextDim);
+  }
   fill_rect(c,20,52,kPanelW-20,53,kDivider);
   char timer[48]={};
   timer_value(timer,sizeof(timer));
   for (int i=0;i<page_count();i++) {
-    const int y=kRowY0+i*kRowH;
+    const int y=row_y(i),rh=row_h(i);
+    const bool volume_row=g_page==kPageDisplay && i==4;
     const bool sel=i==g_sel;
     const uint32_t row_bg=sel?kSelected:kBg;
     if (sel) {
-      fill_round(c,kRowX0,y+2,kPanelW-kRowX0,y+kRowH-2,10,kSelected);
-      fill_round(c,kRowX0,y+10,kRowX0+4,y+kRowH-10,2,kRed);
+      fill_round(c,kRowX0,y+2,kPanelW-kRowX0,y+rh-2,10,kSelected);
+      fill_round(c,kRowX0,y+10,kRowX0+4,y+rh-10,2,kRed);
     }
-    const float x=kRowX0+30, cy=y+kRowH/2.f;
+    const float x=kRowX0+30;
+    // The volume row has two lines: label and value on top, slider below.
+    const float cy=y+(volume_row?kRowH/2.f:rh/2.f);
     icon_item(c,i,x,cy,sel?kText:kTextDim,row_bg);
     const Font& font=sel?kBold:kRegular;
     draw_text(c,kRowX0+56,y+(kRowH-font.h)/2,
               item_text(i),sel?kText:0xdedede,font);
+    if(volume_row){
+      // Dedicated second line: no overlap with "UI sounds volume" or pill.
+      const int x0=kRowX0+62, x1=kPanelW-kRowX0-30;
+      const int center=y+kRowH+10;
+      fill_round(c,x0,center-3,x1,center+3,3,kSurface);
+      const int knob=x0+(x1-x0)*g_ui_volume/100;
+      if(knob>x0)fill_round(c,x0,center-3,knob,center+3,3,kRed);
+      disc(c,knob,center,6,kText);
+    }
     char scratch[48]={};
     const char* value=item_value(i,timer,scratch,sizeof(scratch));
     if (value) {
@@ -566,10 +760,12 @@ void compose_panel() {
   g_img_w=kPanelW;
   g_img_h=h;
   __sync_add_and_fetch(&g_img_gen,1);
+  pthread_mutex_unlock(&g_overlay_image_lock);
 }
 
 // icon: 0 none, 1 camera, 2 timer, 3 screen
 void compose_toast(const char* text, int icon) {
+  pthread_mutex_lock(&g_overlay_image_lock);
   const int w = text_width(text) + (icon ? 76 : 48), h = kToastH;
   Canvas c = {g_img, w > kPanelW ? kPanelW : w, h};
   base_panel(c, kSurface, h / 2);
@@ -586,6 +782,7 @@ void compose_toast(const char* text, int icon) {
   g_img_w = c.w;
   g_img_h = h;
   __sync_add_and_fetch(&g_img_gen, 1);
+  pthread_mutex_unlock(&g_overlay_image_lock);
 }
 
 bool overlay_visible() {
@@ -625,6 +822,7 @@ void black_idle_restore();
 void set_screen_off(bool off) {
   if (off == g_screen_off) return;
   g_screen_off = off;
+  if(off)ytv_ui_sound(15); // iOS lock cue when screen goes black
   if (!off) black_idle_restore();
   char line[80];
   snprintf(line, sizeof(line), "YTV_LIFECYCLE_ADDON screen_black=%d\n", (int)off);
@@ -751,54 +949,87 @@ void restore_idle_paint() {
 }
 
 void idle_paint(uint64_t now) {
-  // Cobalt is presenting frames: the GL path draws the overlay.
-  // (signed: the renderer may have swapped after `now` was read)
-  if ((int64_t)(now - g_last_swap_us) < 120000) { g_painted_base = nullptr; return; }
-  SceDisplayFrameBuf fb;
-  memset(&fb, 0, sizeof(fb));
-  fb.size = sizeof(fb);
-  if (sceDisplayGetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME) < 0 || !fb.base) return;
-  uint32_t gen = g_img_gen;
-  int w = g_img_w, h = g_img_h;
-  int x0 = (kScreenW - w) / 2, y0 = (kScreenH - h) / 2;
-  bool same_place = fb.base == g_painted_base && g_last_swap_us == g_painted_after_swap &&
-                    x0 == g_painted_x && y0 == g_painted_y && w == g_painted_w && h == g_painted_h;
-  if (same_place && gen == g_painted_gen) return;
-  if (!same_place) {
+  // If Cobalt is presenting frames the normal GL path paints the overlay.
+  if ((int64_t)(now-g_last_swap_us)<120000){
+    g_painted_base=nullptr;
+    return;
+  }
+  SceDisplayFrameBuf fb={};
+  fb.size=sizeof(fb);
+  if(sceDisplayGetFrameBuf(&fb,SCE_DISPLAY_SETBUF_NEXTFRAME)<0 || !fb.base)return;
+  pthread_mutex_lock(&g_overlay_image_lock);
+  const uint32_t gen=g_img_gen;
+  const int panel_w=g_img_w,panel_h=g_img_h;
+  const int panel_x=(kScreenW-panel_w)/2,panel_y=(kScreenH-panel_h)/2;
+  const bool scrim=g_menu_open;
+  const int x0=scrim?0:panel_x,y0=scrim?0:panel_y;
+  const int w=scrim?kScreenW:panel_w,h=scrim?kScreenH:panel_h;
+  const bool same_place=fb.base==g_painted_base &&
+      g_last_swap_us==g_painted_after_swap &&
+      x0==g_painted_x && y0==g_painted_y &&
+      w==g_painted_w && h==g_painted_h;
+  if(same_place && gen==g_painted_gen){
+    pthread_mutex_unlock(&g_overlay_image_lock);
+    return;
+  }
+  if(!same_place){
     restore_idle_paint();
-    if (!g_backup) g_backup = (uint8_t*)malloc((size_t)kPanelW * kPanelH * 4);
-    if (!g_backup) return;
-    for (int y = 0; y < h; y++)
-      memcpy(g_backup + (size_t)y * w * 4, (uint32_t*)fb.base + (size_t)(y0 + y) * fb.pitch + x0,
-             (size_t)w * 4);
+    const size_t required=(size_t)w*h*4;
+    if(g_backup_capacity<required){
+      void* expanded=realloc(g_backup,required);
+      if(!expanded){
+        pthread_mutex_unlock(&g_overlay_image_lock);
+        return;
+      }
+      g_backup=(uint8_t*)expanded;
+      g_backup_capacity=required;
+    }
+    for(int y=0;y<h;y++)
+      memcpy(g_backup+(size_t)y*w*4,
+             (uint32_t*)fb.base+(size_t)(y0+y)*fb.pitch+x0,
+             (size_t)w*4);
   }
-  for (int y = 0; y < h; y++) {
-    uint32_t* dst = (uint32_t*)fb.base + (size_t)(y0 + y) * fb.pitch + x0;
-    const uint32_t* src = (const uint32_t*)(g_img + (size_t)y * w * 4);
-    const uint32_t* under = (const uint32_t*)(g_backup + (size_t)y * w * 4);
-    for (int x = 0; x < w; x++) dst[x] = (src[x] >> 24) ? src[x] : under[x];
+  if(scrim){
+    // Rebuild from the original backup rather than darkening repeatedly.
+    for(int y=0;y<kScreenH;y++){
+      uint32_t* dst=(uint32_t*)fb.base+(size_t)y*fb.pitch;
+      const uint32_t* src=(const uint32_t*)(g_backup+(size_t)y*kScreenW*4);
+      for(int x=0;x<kScreenW;x++)
+        dst[x]=(src[x]&0xFF000000u)|((src[x]&0x00FEFEFEu)>>1);
+    }
   }
-  {
-    char line[128];
-    snprintf(line, sizeof(line), "YTV_ADDON_IDLE_PAINT base=%p gen=%u since_swap_ms=%llu\n", fb.base,
-             (unsigned)gen, (unsigned long long)((now - g_last_swap_us) / 1000));
-    log_line(line);
+  for(int y=0;y<panel_h;y++){
+    uint32_t* dst=(uint32_t*)fb.base+(size_t)(panel_y+y)*fb.pitch+panel_x;
+    const uint32_t* src=(const uint32_t*)(g_img+(size_t)y*panel_w*4);
+    const uint32_t* under=(const uint32_t*)(g_backup+(size_t)(scrim?panel_y+y:y)*w*4);
+    for(int x=0;x<panel_w;x++)
+      if(src[x]>>24)dst[x]=src[x];
+      else if(!scrim)dst[x]=under[x];
   }
-  g_painted_base = fb.base;
-  g_painted_gen = gen;
-  g_painted_after_swap = g_last_swap_us;
-  g_painted_x = x0; g_painted_y = y0; g_painted_w = w; g_painted_h = h;
+  char line[144];
+  snprintf(line,sizeof(line),
+           "YTV_ADDON_IDLE_PAINT base=%p gen=%u scrim=%d since_swap_ms=%llu\n",
+           fb.base,(unsigned)gen,(int)scrim,
+           (unsigned long long)((now-g_last_swap_us)/1000));
+  log_line(line);
+  g_painted_base=fb.base;
+  g_painted_gen=gen;
+  g_painted_after_swap=g_last_swap_us;
+  g_painted_x=x0;g_painted_y=y0;g_painted_w=w;g_painted_h=h;
+  pthread_mutex_unlock(&g_overlay_image_lock);
 }
 
 // ---- Menu actions ----------------------------------------------------------
 void open_page(Page page) {
   g_toast_until_ms=0;
   g_page=page;
+  if(page==kPageDownloads){g_download_first=0;refresh_download_list();}
   g_sel=0;
   g_menu_open=true;
   compose_panel();
   const char* name = page == kPagePlayer ? "player" :
                      page == kPageDownload ? "download_format" :
+                     page == kPageDownloads ? "downloads_list" :
                      page == kPageSettings ? "settings" :
                      page == kPageDisplay ? "display" : "home";
   char msg[80];
@@ -812,11 +1043,26 @@ void open_menu(bool open) {
     g_menu_open=false;
     g_page=kPageNone;
     log_line("YTV_LIFECYCLE_ADDON menu=closed\n");
+    if(g_timer_announce_pending && g_timer_deadline_us){
+      g_timer_announce_pending=false;
+      char message[90]={};
+      snprintf(message,sizeof(message),
+          g_pt ? "Dormir em %d minutos" : "Sleep in %d minutes",
+          kTimerMinutes[g_timer_idx]);
+      show_toast(message,2800,2);
+      ytv_ui_sound(14); // HourlyChime, only when the Add-ons menu closes
+      log_line("YTV_SLEEP_TIMER_ENABLED_TOAST\n");
+    }
   }
 }
 void menu_back() {
   if (g_page == kPageHome) open_menu(false);
   else if (g_page == kPageDownload) open_page(kPagePlayer);
+  else if (g_page == kPageDownloads) open_page(g_downloads_return);
+  else if (g_page == kPageNetwork) {
+    open_menu(false);
+    g_network_next_prompt=now_us()+6000000ull;
+  }
   else if (g_page == kPagePlayer && g_player_return == kPageNone) open_menu(false);
   else if (g_page == kPagePlayer && g_player_return == kPageSettings)
     open_page(kPageSettings);
@@ -838,6 +1084,9 @@ void set_timer(int idx) {
   g_timer_deadline_us = kTimerMinutes[g_timer_idx]
                             ? now_us() + (uint64_t)kTimerMinutes[g_timer_idx] * unit_s * 1000000ull
                             : 0;
+  g_timer_announce_pending=g_timer_deadline_us!=0;
+  g_timer_final_alert_played=false;
+  g_timer_countdown_visible=false;
   char line[64];
   snprintf(line, sizeof(line), "YTV_LIFECYCLE_ADDON sleep_timer=%dmin\n", kTimerMinutes[g_timer_idx]);
   log_line(line);
@@ -847,19 +1096,24 @@ void save_cfg() {
   sceIoMkdir("ux0:data/youtubevita",0777);
   SceUID fd=sceIoOpen(kAddonCfg,SCE_O_WRONLY|SCE_O_CREAT|SCE_O_TRUNC,0666);
   if (fd<0) return;
-  char buf[256];
+  char buf[320];
   const int n=snprintf(buf,sizeof(buf),
-      "lr=%d\nadblock=%d\nquality=%s\naudio_only=%d\nlanguage=%d\nfhd=%d\ndim=%d\nperf=%d\nclock=%d\nui_sound=%d\n",
+      "lr=%d\nadblock=%d\nquality=%s\naudio_only=%d\nlanguage=%d\nfhd=%d\ndim=%d\nperf=%d\nclock=%d\nui_sound=%d\nui_volume=%d\nvideo_filter=%s\nvideo_aspect=%d\nmedia_volume=%d\nvideo_vertical=%d\nscreen_flip=%d\n",
       g_lr_enabled?1:0,__atomic_load_n(&g_ytv_adblock_enabled,__ATOMIC_RELAXED),
       kQualityValues[g_quality_idx],g_audio_only?1:0,g_language_pref,
-      g_fhd_cfg?1:0,g_dim_idx,g_perf_hud?1:0,g_clock_hud?1:0,g_ui_sound?1:0);
+      g_fhd_cfg?1:0,g_dim_idx,g_perf_hud?1:0,g_clock_hud?1:0,g_ui_sound?1:0,g_ui_volume,
+      __atomic_load_n(&g_ytv_video_bilinear_enabled,__ATOMIC_RELAXED) ? "bilinear" : "nearest",
+       __atomic_load_n(&g_ytv_video_aspect_mode,__ATOMIC_RELAXED),
+       __atomic_load_n(&g_ytv_media_volume_pct,__ATOMIC_RELAXED),
+       __atomic_load_n(&g_ytv_video_vertical_mode,__ATOMIC_RELAXED),
+       __atomic_load_n(&g_ytv_screen_flip,__ATOMIC_RELAXED));
   if (n>0 && n<(int)sizeof(buf)) sceIoWrite(fd,buf,n);
   sceIoClose(fd);
 }
 void load_cfg() {
   SceUID fd=sceIoOpen(kAddonCfg,SCE_O_RDONLY,0);
   if (fd<0) return;
-  char buf[256]={};
+  char buf[320]={};
   const int n=sceIoRead(fd,buf,sizeof(buf)-1);
   sceIoClose(fd);
   if (n<=0) return;
@@ -878,6 +1132,25 @@ void load_cfg() {
   if (strstr(buf,"clock=1")) g_clock_hud=true;
   if (strstr(buf,"ui_sound=1")) g_ui_sound=true;
   if (strstr(buf,"ui_sound=0")) g_ui_sound=false;
+  if (const char* v=strstr(buf,"ui_volume=")){
+    const int n=atoi(v+10);
+    if(n>=0 && n<=100)g_ui_volume=n;
+  }
+  if(const char* v=strstr(buf,"video_aspect=")){
+    const int mode=atoi(v+13);
+    if(mode>=0 && mode<=2)__atomic_store_n(&g_ytv_video_aspect_mode,mode,__ATOMIC_RELAXED);
+  }
+  if (strstr(buf,"screen_flip=1")) __atomic_store_n(&g_ytv_screen_flip,1,__ATOMIC_RELAXED);
+  if(const char* v=strstr(buf,"video_vertical=")){
+    const int mode=atoi(v+15);
+    if(mode>=0 && mode<=2)__atomic_store_n(&g_ytv_video_vertical_mode,mode,__ATOMIC_RELAXED);
+  }
+  if(const char* v=strstr(buf,"media_volume=")){
+    const int volume=atoi(v+13);
+    if(volume>=0 && volume<=100)__atomic_store_n(&g_ytv_media_volume_pct,volume,__ATOMIC_RELAXED);
+  }
+  if (strstr(buf,"video_filter=nearest"))
+    __atomic_store_n(&g_ytv_video_bilinear_enabled,0,__ATOMIC_RELAXED);
 }
 
 void set_lr(bool on) {
@@ -903,6 +1176,28 @@ void adjust_item(int delta) {
     char msg[64];
     snprintf(msg,sizeof(msg),"YTV_LIFECYCLE_ADDON dim_percent=%d\n",kDimLevels[g_dim_idx]);
     log_line(msg);
+  } else if (g_page==kPagePlayer && g_sel==6) {
+    const int mode=(__atomic_load_n(&g_ytv_video_aspect_mode,__ATOMIC_RELAXED)+3+delta)%3;
+    __atomic_store_n(&g_ytv_video_aspect_mode,mode,__ATOMIC_RELAXED);
+    save_cfg();
+    char msg[96];snprintf(msg,sizeof(msg),"YTV_LIFECYCLE_VIDEO_ASPECT mode=%s\n",
+      mode==1?"zoom":mode==2?"stretch":"original");
+    log_line(msg);
+  } else if (g_page==kPagePlayer && g_sel==7) {
+    const int mode=(__atomic_load_n(&g_ytv_video_vertical_mode,__ATOMIC_RELAXED)+3+delta)%3;
+    __atomic_store_n(&g_ytv_video_vertical_mode,mode,__ATOMIC_RELAXED);
+    save_cfg();
+    char msg[80];snprintf(msg,sizeof(msg),"YTV_LIFECYCLE_VIDEO_VERTICAL mode=%s\n",
+      mode==1?"cw":mode==2?"ccw":"off");
+    log_line(msg);
+  } else if (g_page==kPagePlayer && g_sel==5) {
+    const bool enabled=!__atomic_load_n(&g_ytv_video_bilinear_enabled,__ATOMIC_RELAXED);
+    __atomic_store_n(&g_ytv_video_bilinear_enabled,(int)enabled,__ATOMIC_RELAXED);
+    save_cfg();
+    // Apply only to new video targets, not to currently bound GL textures.
+    // The previous live mutation path correlated with a real Vita crash.
+    log_line(enabled?"YTV_LIFECYCLE_VIDEO_FILTER mode=bilinear apply=next_video\n":
+                     "YTV_LIFECYCLE_VIDEO_FILTER mode=nearest apply=next_video\n");
   } else if (g_page==kPageSettings) {
     switch(g_sel) {
       case 0: toggle_adblock(); break;
@@ -911,6 +1206,13 @@ void adjust_item(int delta) {
       case 3: set_lr(!g_lr_enabled);break;
       case 5: g_language_pref=(g_language_pref+3+delta)%3;
               update_language();save_cfg();break;
+      case 6: {
+        const int on=!__atomic_load_n(&g_ytv_screen_flip,__ATOMIC_RELAXED);
+        __atomic_store_n(&g_ytv_screen_flip,on,__ATOMIC_RELAXED);
+        save_cfg();
+        log_line(on?"YTV_LIFECYCLE_SCREEN_FLIP on=1\n":"YTV_LIFECYCLE_SCREEN_FLIP on=0\n");
+        break;
+      }
     }
   } else if (g_page==kPageDisplay) {
     char msg[64];
@@ -921,6 +1223,13 @@ void adjust_item(int delta) {
       case 1: g_perf_hud=!g_perf_hud;save_cfg();break;
       case 2: g_clock_hud=!g_clock_hud;save_cfg();break;
       case 3: g_ui_sound=!g_ui_sound;ytv_ui_sound_enable(g_ui_sound);save_cfg();
+              break;
+      case 4:
+              g_ui_volume+=10*delta;
+              if(g_ui_volume<0)g_ui_volume=0;
+              if(g_ui_volume>100)g_ui_volume=100;
+              ytv_ui_sound_set_volume(g_ui_volume);
+              save_cfg();
               break;
     }
   }
@@ -972,12 +1281,43 @@ void begin_selected_download(bool mp3){
 }
 
 void activate(int item) {
-  if (g_page==kPageHome) {
+  if(g_page==kPageNetwork){
+    switch(item){
+      case 0:
+        g_network_offline=SbSystemNetworkIsDisconnected();
+        if(g_network_offline){
+          log_line("YTV_NETWORK_NATIVE_RETRY denied=offline\n");
+          compose_panel();
+        }else{
+          const int result=ytv_network_platform_error_retry();
+          g_network_auto_retry_done=true;
+          g_network_seen_offline=false;
+          g_network_next_prompt=now_us()+10000000ull;
+          open_menu(false);
+          log_line(result==1?"YTV_NETWORK_NATIVE_RETRY action=cobalt_callback\n":
+                              "YTV_NETWORK_NATIVE_RETRY action=connected_event\n");
+          show_toast(T("Reconnecting YouTube...", "Reconectando ao YouTube..."),
+                     2600,0);
+        }
+        break;
+      case 1: {
+        const int result=sceAppMgrLaunchAppByUri(0xFFFFF,"settings_dlg:");
+        char line[120];
+        snprintf(line,sizeof(line),
+                 "YTV_NETWORK_NATIVE_SETTINGS result=0x%x\n",(unsigned)result);
+        log_line(line);
+        if(result<0)compose_panel();
+        break;
+      }
+      default:menu_back();break;
+    }
+  } else if (g_page==kPageHome) {
     switch (item) {
       case 0: g_player_return=kPageHome;open_page(kPagePlayer);break;
-      case 1: open_page(kPageSettings);break;
-      case 2: open_page(kPageDisplay);break;
-      case 3: {
+      case 1: g_downloads_return=kPageHome;open_page(kPageDownloads);break;
+      case 2: open_page(kPageSettings);break;
+      case 3: open_page(kPageDisplay);break;
+      case 4: {
         // The Vita Settings app opens on top; YouTube stays open in the
         // background and comes back from the LiveArea / PS button.
         open_menu(false);
@@ -997,17 +1337,18 @@ void activate(int item) {
               g_shot_at_us=now_us()+250000;break;
       case 2: adjust_item(1);break;
       case 3: open_menu(false);
-              show_toast(T("Black screen in a moment. SELECT brings it back",
-                           "A tela vai escurecer. SELECT volta"),1800,3);
+              show_toast(T("Black Screen: SELECT to return",
+                           "Tela preta: SELECT para voltar"),1800,3);
               g_screen_off_at_us=now_us()+1800000;break;
-      case 4: adjust_item(1);break;
+      case 4: case 5: case 6: case 7: adjust_item(1);break;
       default: menu_back();break;
     }
   } else if (g_page==kPageDownload) {
     switch(item){
       case 0: begin_selected_download(false);break; // Video MP4
       case 1: begin_selected_download(true);break;  // Audio MP3
-      case 2: {
+      case 2: g_downloads_return=kPageDownload;open_page(kPageDownloads);break;
+      case 3: {
         const bool cancelled=ytv_native_download_cancel_current();
         open_menu(false);
         show_toast(cancelled?
@@ -1018,24 +1359,37 @@ void activate(int item) {
       }
       default: menu_back();break;
     }
+  } else if (g_page==kPageDownloads) {
+    const int n=download_visible();
+    if(item==n){
+      if(g_download_count<=kDownloadsVisible)refresh_download_list();
+      else {
+        g_download_first=(g_download_first+kDownloadsVisible>=g_download_count)
+                            ? 0:g_download_first+kDownloadsVisible;
+      }
+      g_sel=0;
+      compose_panel();
+      log_line("YTV_LIFECYCLE_ADDON downloads_view_more\n");
+    } else if(item==n+1)menu_back();
   } else if (g_page==kPageSettings) {
     switch(item) {
-      case 0: case 1: case 2: case 3: case 5: adjust_item(1);break;
+      case 0: case 1: case 2: case 3: case 5: case 6: adjust_item(1);break;
       case 4: open_menu(false);g_input_locked=true;
+              ytv_ui_sound(12);  // controls lock
               log_line("YTV_LIFECYCLE_ADDON input_locked=1\n");
               show_toast(T("Input locked. SELECT unlocks",
                            "Entrada bloqueada. SELECT desbloqueia"),2500,4);break;
       default: menu_back();break;
     }
   } else if (g_page==kPageDisplay) {
-    if (item>=0 && item<=3) adjust_item(1);
+    if (item>=0 && item<=4) adjust_item(1);
     else menu_back();
   }
 }
 
 // ---- On-screen info (HUD) -------------------------------------------------------
 // Composed on the main thread once a second, drawn by the GL path every frame.
-constexpr int kHudW = 340, kHudH = 120;
+constexpr int kHudW = 340, kHudH = 180;
 uint8_t* g_hud = nullptr;
 volatile int g_hud_w = 0, g_hud_h = 0;
 volatile uint32_t g_hud_gen = 0;
@@ -1044,7 +1398,7 @@ int g_dropped_per_s = 0;
 
 void compose_hud() {
   if (!g_hud) return;
-  char lines[5][64];
+  char lines[8][64];
   int n = 0;
   if (g_clock_hud) {
     SceDateTime t;
@@ -1070,12 +1424,20 @@ void compose_hud() {
       snprintf(lines[n++], 64, "%s %dp   %s %d/s", T("video", "vídeo"), g_ytv_hud_video_h,
                T("dropped", "perdidos"), g_dropped_per_s);
   }
+  if (g_timer_countdown_visible && n<8) {
+    const uint64_t now=now_us();
+    int secs=g_timer_deadline_us>now
+      ? (int)((g_timer_deadline_us-now+999999ull)/1000000ull):0;
+    if(secs>60)secs=60;
+    snprintf(lines[n++],64,g_pt?"Tela preta em %02d s":"Sleep in %02d s",secs);
+  }
   if (!n) { g_hud_w = 0; return; }
   int w = 0;
   for (int i = 0; i < n; i++) { int tw = text_width(lines[i]); if (tw > w) w = tw; }
   w += 24;
   if (w > kHudW) w = kHudW;
   const int h = 8 + n * 22;
+  pthread_mutex_lock(&g_overlay_image_lock);
   Canvas c = {g_hud, w, h};
   base_panel(c, 0x000000, 10);
   for (int i = 0; i < w * h; i++) if (g_hud[i * 4 + 3]) g_hud[i * 4 + 3] = 170;  // translucent
@@ -1083,6 +1445,7 @@ void compose_hud() {
   g_hud_w = w;
   g_hud_h = h;
   __sync_add_and_fetch(&g_hud_gen, 1);
+  pthread_mutex_unlock(&g_overlay_image_lock);
 }
 
 }  // namespace
@@ -1091,6 +1454,18 @@ void compose_hud() {
 volatile uint64_t g_ytv_audio_active_us = 0;
 
 extern "C" {
+
+// Safe cross-thread completion signal. The downloader does not touch the
+// Add-ons canvas or GPU. One atomic increment per successfully saved MP3/MP4.
+void ytv_addons_download_completed(){
+  __sync_add_and_fetch(&g_downloads_completed,1u);
+}
+void ytv_addons_download_quality_fallback(int requested,int actual){
+  if(requested<=actual || actual<1 || requested<1)return;
+  __atomic_store_n(&g_mp4_fallback_requested,requested,__ATOMIC_RELEASE);
+  __atomic_store_n(&g_mp4_fallback_actual,actual,__ATOMIC_RELEASE);
+  __sync_add_and_fetch(&g_mp4_fallback_serial,1u);
+}
 
 // Main thread, every input poll, before buttons reach Cobalt. Returns true
 // when the add-on layer consumed this poll (Cobalt then sees no change).
@@ -1132,10 +1507,16 @@ bool ytv_addons_input(uint32_t previous, uint32_t current) {
   if (pressed&SCE_CTRL_DOWN) {g_sel=(g_sel+1)%page_count();ytv_ui_sound(1);}
   if (pressed&(SCE_CTRL_LEFT|SCE_CTRL_RIGHT)) {
     const int delta=(pressed&SCE_CTRL_LEFT)?-1:1;
-    if ((g_page==kPagePlayer && (g_sel==2 || g_sel==4)) ||
+    if(g_page==kPageDownloads && g_download_count>kDownloadsVisible){
+      const int pages=(g_download_count+kDownloadsVisible-1)/kDownloadsVisible;
+      g_download_first=((g_download_first/kDownloadsVisible+pages+delta)%pages)*kDownloadsVisible;
+      g_sel=0;
+      ytv_ui_sound(1);
+    }
+    if ((g_page==kPagePlayer && (g_sel==2 || g_sel==4 || g_sel==5 || g_sel==6 || g_sel==7)) ||
         (g_page==kPageSettings && (g_sel==0 || g_sel==1 ||
-                                  g_sel==2 || g_sel==3 || g_sel==5)) ||
-        (g_page==kPageDisplay && g_sel<=3))
+                                  g_sel==2 || g_sel==3 || g_sel==5 || g_sel==6)) ||
+        (g_page==kPageDisplay && g_sel<=4))
       {adjust_item(delta);ytv_ui_sound(1);}
   }
   if (pressed&SCE_CTRL_CIRCLE) { ytv_ui_sound(3);menu_back();return true; }
@@ -1152,10 +1533,39 @@ bool ytv_addons_menu_open() { return g_menu_open || g_screen_off || g_input_lock
 // (graphics extension in port_system.cpp), so the overlay is always drawn by
 // the GL path on top of a fresh frame. The CPU idle path painted pages over
 // copies that could already contain the previous page (stacked menus).
-bool ytv_addons_wants_frames() { return overlay_visible(); }
+bool ytv_addons_wants_frames() {
+  return overlay_visible() || g_timer_countdown_visible;
+}
 
+void ytv_addons_adjust_media(int volume_delta,int brightness_delta){
+  if(g_input_locked || g_screen_off || g_menu_open)return;
+  char message[80]={};
+  if(volume_delta){
+    int volume=__atomic_load_n(&g_ytv_media_volume_pct,__ATOMIC_RELAXED)+volume_delta;
+    if(volume<0)volume=0;
+    if(volume>100)volume=100;
+    __atomic_store_n(&g_ytv_media_volume_pct,volume,__ATOMIC_RELAXED);
+    snprintf(message,sizeof(message),g_pt?"Volume: %d%%":"Volume: %d%%",volume);
+  }else if(brightness_delta){
+    // The VitaSDK exposes no user-mode backlight setter. Reuse the existing
+    // native overlay dimming, with non-wrapping steps (original -> 90% dim).
+    int idx=g_dim_idx-brightness_delta;
+    if(idx<0)idx=0;
+    if(idx>=kDimChoices)idx=kDimChoices-1;
+    g_dim_idx=idx;
+    snprintf(message,sizeof(message),g_pt?"Brilho: %d%%":"Brightness: %d%%",
+             100-kDimLevels[g_dim_idx]);
+  }else return;
+  show_toast(message,1200,0);
+  char log[128];snprintf(log,sizeof(log),"YTV_V063_ANALOG_ADJUST %s\n",message);
+  log_line(log);
+  // Avoid disk writes on every held-stick step; persist only after a pause.
+  // save_cfg is scheduled by the main-thread tick below.
+  g_media_cfg_dirty_since=now_us();
+}
 void ytv_addons_toggle() {
   if (g_input_locked || g_screen_off) return;
+  ytv_ui_sound(g_menu_open?3:6);
   open_menu(!g_menu_open);
 }
 
@@ -1175,17 +1585,27 @@ void ytv_addons_tap(float x, float y) {
     return;
   }
   for (int i=0;i<page_count();i++) {
-    const int ry=kRowY0+i*kRowH;
-    if (py>=ry && py<ry+kRowH) {
+    const int ry=row_y(i),rh=row_h(i);
+    if (py>=ry && py<ry+rh) {
       g_sel=i;
-      ytv_ui_sound(2);
-      if (g_page==kPagePlayer && i==2 && px<kPanelW/3)
+      // Physical touch is already sounded once in port_input; don't replay
+      // confirm over the focus_change_small cue on the same gesture.
+      if (g_page==kPageDisplay && i==4 &&
+          py>=ry+kRowH && px>=kRowX0+50){
+        const int x0=kRowX0+62,x1=kPanelW-kRowX0-30;
+        g_ui_volume=(px-x0)*100/(x1-x0);
+        if(g_ui_volume<0)g_ui_volume=0;
+        if(g_ui_volume>100)g_ui_volume=100;
+        ytv_ui_sound_set_volume(g_ui_volume);
+        save_cfg();
+        compose_panel();
+      } else if (g_page==kPagePlayer && i==2 && px<kPanelW/3)
         adjust_item(-1);
       else if (g_page==kPageSettings &&
-               (i==0 || i==1 || i==2 || i==3 || i==5) &&
+               (i==0 || i==1 || i==2 || i==3 || i==5 || i==6) &&
                px<kPanelW/3)
         adjust_item(-1);
-      else if (g_page==kPagePlayer && i==4 && px<kPanelW/3)
+      else if (g_page==kPagePlayer && (i==4 || i==5 || i==6 || i==7) && px<kPanelW/3)
         adjust_item(-1);
       else activate(i);
       return;
@@ -1193,53 +1613,108 @@ void ytv_addons_tap(float x, float y) {
   }
 }
 
-// Saved Full HD choice, read straight from addons.cfg: the graphics and video
-// start-up need it before the menu initialises.
-//
-// Crash guard: a run with Full HD leaves ux0:data/youtubevita/fhd_probe until
-// it proves healthy (a 1080p decoder produced pictures, or two minutes passed
-// without one being created). If the probe is still there at the next start,
-// that run died with Full HD on: this start turns Full HD off (and saves it),
-// so a crash can never repeat at every launch.
+// Full HD is only available on the Full (extended-memory) VPK and takes
+// effect after restart. Read the setting before the Add-ons UI initializes.
+// Crash guard v0.60: a persistent probe is armed only while an actual 1080p
+// decoder is being constructed/used. Simply starting and closing the app
+// with Full HD enabled must NEVER trigger the previous-run crash guard.
 constexpr const char* kFhdProbe = "ux0:data/youtubevita/fhd_probe";
-int g_fhd_state = -1;          // cached: -1 unknown, 0 off, 1 on
-bool g_fhd_auto_off = false;   // disabled by the guard this run (toast)
+int g_fhd_state = -1;            // -1 unknown, 0 off, 1 on
+bool g_fhd_auto_off = false;
+int g_fhd_guard_owners = 0;      // players with a Full HD decoder or attempt
+bool g_fhd_probe_present = false;
+pthread_mutex_t g_fhd_guard_mutex = PTHREAD_MUTEX_INITIALIZER;
+constexpr const char kFhdProbeSignature[]="YTV60FHD\n";
 int ytv_addons_cfg_fhd() {
   if (g_fhd_state >= 0) return g_fhd_state;
   g_fhd_state = 0;
   SceUID fd = sceIoOpen(kAddonCfg, SCE_O_RDONLY, 0);
   if (fd < 0) return 0;
-  char buf[256] = {0};
-  sceIoRead(fd, buf, sizeof(buf) - 1);
+  char buf[256] = {};
+  int n=sceIoRead(fd, buf, sizeof(buf)-1);
   sceIoClose(fd);
+  if (n<=0) return 0;
   if (!strstr(buf, "fhd=1")) {
+    // Never leave an old probe behind when the user has chosen Off.
     sceIoRemove(kFhdProbe);
     return 0;
   }
-  SceIoStat st;
-  if (sceIoGetstat(kFhdProbe, &st) >= 0) {
-    g_fhd_auto_off = true;
+  SceUID probe = sceIoOpen(kFhdProbe,SCE_O_RDONLY,0);
+  if(probe>=0){
+    char marker[sizeof(kFhdProbeSignature)]={};
+    int n=sceIoRead(probe,marker,sizeof(kFhdProbeSignature)-1);
+    sceIoClose(probe);
     sceIoRemove(kFhdProbe);
-    // Rewrite the setting off (keep the rest of the file as it is).
-    char* at = strstr(buf, "fhd=1");
-    at[4] = '0';
-    SceUID w = sceIoOpen(kAddonCfg, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
-    if (w >= 0) { sceIoWrite(w, buf, strlen(buf)); sceIoClose(w); }
-    SbLogRaw("YTV_LIFECYCLE_ADDON fhd=auto_off (previous Full HD run did not finish)\n");
-    return 0;
+    // Old releases created a ZERO-byte marker merely by starting the app.
+    // Treat only versioned probes of actual v0.60 decoder attempts as a
+    // previous-run 1080p failure; never auto-disable on a stale v0.59 file.
+    if(n==(int)sizeof(kFhdProbeSignature)-1 &&
+       memcmp(marker,kFhdProbeSignature,sizeof(kFhdProbeSignature)-1)==0){
+      g_fhd_auto_off = true;
+      char* at = strstr(buf, "fhd=1");
+      at[4] = '0';
+      SceUID w=sceIoOpen(kAddonCfg,SCE_O_WRONLY|SCE_O_CREAT|SCE_O_TRUNC,0666);
+      if(w>=0){sceIoWrite(w,buf,strlen(buf));sceIoClose(w);}
+      SbLogRaw("YTV_LIFECYCLE_ADDON fhd=auto_off previous_1080p_probe=1\n");
+      return 0;
+    }
+    SbLogRaw("YTV_LIFECYCLE_ADDON fhd=legacy_probe_ignored\n");
   }
-  SceUID p = sceIoOpen(kFhdProbe, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
-  if (p >= 0) sceIoClose(p);
   g_fhd_state = 1;
+  SbLogRaw("YTV_LIFECYCLE_ADDON fhd=enabled guard=deferred_until_1080p_decoder\n");
   return 1;
 }
-// Full HD proved healthy this run (called by the player or the tick).
+// Called on the decoder/player setup thread, NOT per frame.
+void ytv_addons_fhd_begin() {
+  if(g_fhd_state!=1)return;
+  pthread_mutex_lock(&g_fhd_guard_mutex);
+  if(g_fhd_guard_owners++ > 0){
+    pthread_mutex_unlock(&g_fhd_guard_mutex);
+    return;
+  }
+  sceIoMkdir("ux0:data/youtubevita",0777);
+  SceUID fd=sceIoOpen(kFhdProbe,SCE_O_WRONLY|SCE_O_CREAT|SCE_O_TRUNC,0666);
+  int wrote=fd>=0?sceIoWrite(fd,kFhdProbeSignature,sizeof(kFhdProbeSignature)-1):-1;
+  if(fd>=0)sceIoClose(fd);
+  g_fhd_probe_present=wrote==(int)sizeof(kFhdProbeSignature)-1;
+  if(!g_fhd_probe_present)sceIoRemove(kFhdProbe);
+  pthread_mutex_unlock(&g_fhd_guard_mutex);
+  SbLogRaw(g_fhd_probe_present ?
+      "YTV_LIFECYCLE_ADDON fhd=probe_armed version=60 real_1080p=1\n" :
+      "YTV_LIFECYCLE_ADDON fhd=probe_unavailable\n");
+}
+// On a normal player tear-down, release the guard. Leaving/reopening an app
+// must not be classified as a crash if SbPlayerDestroy completed normally.
+void ytv_addons_fhd_end() {
+  if(g_fhd_state!=1)return;
+  pthread_mutex_lock(&g_fhd_guard_mutex);
+  if(g_fhd_guard_owners<=0){
+    pthread_mutex_unlock(&g_fhd_guard_mutex);
+    return;
+  }
+  if(--g_fhd_guard_owners>0){
+    pthread_mutex_unlock(&g_fhd_guard_mutex);
+    return;
+  }
+  if(g_fhd_probe_present){
+    sceIoRemove(kFhdProbe);
+    g_fhd_probe_present=false;
+  }
+  pthread_mutex_unlock(&g_fhd_guard_mutex);
+  SbLogRaw("YTV_LIFECYCLE_ADDON fhd=normal_decoder_close\n");
+}
+// The hardware decoded at least thirty 1080p pictures: clear the crash guard
+// for this decoder without claiming all 1080p content/bitrates will work.
 void ytv_addons_fhd_ok() {
-  static bool done = false;
-  if (done || g_fhd_state != 1) return;
-  done = true;
-  sceIoRemove(kFhdProbe);
-  SbLogRaw("YTV_LIFECYCLE_ADDON fhd=healthy\n");
+  if(g_fhd_state!=1)return;
+  pthread_mutex_lock(&g_fhd_guard_mutex);
+  const bool armed=g_fhd_probe_present;
+  if(armed){
+    sceIoRemove(kFhdProbe);
+    g_fhd_probe_present=false;
+  }
+  pthread_mutex_unlock(&g_fhd_guard_mutex);
+  if(armed)SbLogRaw("YTV_LIFECYCLE_ADDON fhd=decoded_30_frames\n");
 }
 
 // Main thread, every loop iteration.
@@ -1256,27 +1731,178 @@ void ytv_addons_tick() {
     update_language();
     if (g_fhd_auto_off) g_fhd_cfg = false;  // the guard turned it off this start
     g_fhd_boot = g_fhd_cfg;
+    ytv_ui_sound_set_volume(g_ui_volume);
     ytv_ui_sound_enable(g_ui_sound);
     if (g_fhd_auto_off)
       show_toast(T("Full HD failed last time: turned off", "Full HD falhou da última vez: desligado"),
                  4000, 0);
   }
   if (!g_img) return;
+#if defined(YTV_NATIVE_DOWNLOAD_TEST)
+  static bool unit_tests_once=false;
+  if(!unit_tests_once){
+    unit_tests_once=true;
+    char report[120];
+    snprintf(report,sizeof(report), "YTV_DOWNLOAD_DIAGNOSTICS metadata=%d quality=%d media_size=%d\n",
+      ytv_metadata_selftest(),ytv_download_quality_selftest(),
+      ytv_media_size_selftest());
+    SbLogRaw(report);
+  }
+  // Dedicated Vita3K smoke hook, compiled OUT of all public/local normal
+  // builds. Only starts when the explicit test URL marker exists.
+  static bool test_once=false;
+  // Only start the MP3 test when H.264 picture decoding is already active.
+  // This deliberately stresses video + download concurrently (the user's
+  // artifact report), rather than downloading during the initial menu.
+  if(!test_once && now_us()>=12000000ull &&
+     ytv_native_player_present() && g_ytv_hud_video_h>0){
+    test_once=true;
+    char input[128]={};
+    SceUID f=sceIoOpen("ux0:data/youtubevita/native_test_url.txt",SCE_O_RDONLY,0);
+    if(f>=0){
+      int n=sceIoRead(f,input,sizeof(input)-1);
+      sceIoClose(f);
+      if(n>0){
+        input[n]=0;
+        char*stop=strpbrk(input,"\r\n");
+        if(stop)*stop=0;
+        if(ytv_native_download_set_video(input)){
+          const int test_height=g_ytv_hud_video_h;
+          SceIoStat force_video={};
+          const bool video_480=sceIoGetstat(
+              "ux0:data/youtubevita/test_force_video480.txt",&force_video)>=0;
+          int test_rc=ytv_native_download_start(!video_480,video_480?480:360);
+          char line[155];snprintf(line,sizeof(line),
+            "YTV_LIFECYCLE_TEST_DOWNLOAD_AUTOSTART rc=%d mp4_480=%d player_active=%d video_h=%d\n",
+            test_rc,(int)video_480,(int)ytv_native_player_present(),test_height);
+          log_line(line);
+        }
+      }
+    }
+  }
+#endif
   uint64_t now = now_us();
-  // Sleep timer.
+  if(now-g_network_last_check>=1000000ull){
+    g_network_last_check=now;
+    const bool offline=SbSystemNetworkIsDisconnected();
+    const bool previous=g_network_offline;
+    g_network_offline=offline;
+    const unsigned generation=ytv_network_platform_error_generation();
+    const bool error_pending=ytv_network_platform_error_pending()!=0;
+    const bool new_error=generation!=g_network_error_seen;
+    if(new_error)g_network_error_seen=generation;
+    if(offline){
+      g_network_seen_offline=true;
+      g_network_online_since=0;
+      g_network_auto_retry_done=false;
+    }else if(previous || !g_network_online_since)g_network_online_since=now;
+    if(!offline && g_network_seen_offline && error_pending &&
+       !g_network_auto_retry_done && g_network_online_since &&
+       now-g_network_online_since>=2500000ull){
+      g_network_auto_retry_done=true;
+      int retried=ytv_network_platform_error_retry();
+      log_line(retried==1?"YTV_NETWORK_AUTO_RECOVERY callback=positive\n":
+                          "YTV_NETWORK_AUTO_RECOVERY no_callback\n");
+      if(retried==1 && g_page==kPageNetwork)open_menu(false);
+      if(retried==1)g_network_seen_offline=false;
+    }
+    if((offline || new_error) && !g_menu_open &&
+       now>=g_network_next_prompt && now>3500000ull){
+      open_page(kPageNetwork);
+      g_network_next_prompt=now+7000000ull;
+      log_line(offline?"YTV_NETWORK_NATIVE_DIALOG offline\n":
+                       "YTV_NETWORK_NATIVE_DIALOG cobalt_load_error\n");
+    }else if(g_page==kPageNetwork && previous!=offline){
+      compose_panel();
+    }
+  }
+#if defined(YTV_NATIVE_DOWNLOAD_TEST)
+  static bool listing_once=false;
+  if(!listing_once && now>=24000000ull){
+    listing_once=true;
+    g_downloads_return=kPageHome;
+    open_page(kPageDownloads);
+    log_line("YTV_LIFECYCLE_TEST_DOWNLOADS_PAGE_OPENED\n");
+  }
+#endif
+  if(g_media_cfg_dirty_since && now-g_media_cfg_dirty_since>=700000ull){
+    g_media_cfg_dirty_since=0;
+    save_cfg();
+  }
+  // Countdown is a compact native HUD for exactly the final 60 seconds.
+  // The long 3.06s go_to_sleep_alert sounds only once, ~4s before blackout.
+  if(g_timer_deadline_us && now<g_timer_deadline_us){
+    const uint64_t left=g_timer_deadline_us-now;
+    g_timer_countdown_visible=left<=60000000ull;
+    if(left<=4000000ull && !g_timer_final_alert_played){
+      g_timer_final_alert_played=true;
+      ytv_ui_sound(13);
+      log_line("YTV_SLEEP_TIMER_FINAL_ALERT go_to_sleep_alert\n");
+    }
+  }else{
+    g_timer_countdown_visible=false;
+  }
   if (g_timer_deadline_us && now >= g_timer_deadline_us) {
     g_timer_deadline_us = 0;
     g_timer_idx = 0;
-    log_line("YTV_LIFECYCLE_ADDON sleep_timer=expired pause\n");
+    g_timer_announce_pending=false;
+    log_line("YTV_LIFECYCLE_ADDON sleep_timer=expired pause_black\n");
     send_key(kSbKeyPause);
+    // Native Black Screen keeps audio/system alive rather than invoking
+    // scePowerRequestDisplayOff, which suspends the app on Vita.
+    set_screen_off(true);
     if (g_menu_open) compose_panel();
-    else show_toast(T("Sleep timer: video paused", "Timer: vídeo pausado"), 3000, 2);
+  }
+  // Downloads report completion from the worker using an atomic counter.
+  const unsigned downgrade=__atomic_load_n(&g_mp4_fallback_serial,__ATOMIC_ACQUIRE);
+  if(downgrade!=g_mp4_fallback_displayed && !overlay_visible()){
+    g_mp4_fallback_displayed=downgrade;
+    const int requested=__atomic_load_n(&g_mp4_fallback_requested,__ATOMIC_ACQUIRE);
+    const int actual=__atomic_load_n(&g_mp4_fallback_actual,__ATOMIC_ACQUIRE);
+    char message[104];
+    snprintf(message,sizeof(message),
+      g_pt ? "%dp indisponível; MP4 em %dp" : "%dp unavailable; MP4 at %dp",
+      requested,actual);
+    show_toast(message,3600,0);
+    log_line("YTV_ADDON_TOAST_DOWNLOAD_QUALITY_DOWNGRADE\n");
+  }
+  const unsigned completed=__atomic_load_n(&g_downloads_completed,__ATOMIC_ACQUIRE);
+  if(completed!=g_downloads_completed_notified && !overlay_visible()){
+    g_downloads_completed_notified=completed;
+    show_toast(T("Downloads completed","Downloads concluídos"),3300,0);
+    log_line("YTV_ADDON_TOAST_DOWNLOADS_COMPLETED\n");
+  }
+  // Low-battery warning once at <=15%; re-arm only after a recovery above
+  // 20% to avoid repeated sounds when battery fluctuates around 15%.
+  {
+    static uint64_t battery_check=0;
+    if(now-battery_check>=5000000ull){
+      battery_check=now;
+      const int pct=scePowerGetBatteryLifePercent();
+      const bool charging=scePowerIsBatteryCharging()>0;
+      if(pct>=0 && pct<=15 && !charging && !g_battery_warned){
+        g_battery_warned=true;
+        g_battery_pending=true;
+        log_line("YTV_ADDON_BATTERY_LOW threshold=15\n");
+      }else if(charging || pct>20){
+        g_battery_warned=false;
+      }
+    }
+    if(g_battery_pending && !overlay_visible()){
+      g_battery_pending=false;
+      ytv_ui_sound(18);
+      show_toast(T("Low battery (15% or less)",
+                   "Bateria fraca (15% ou menos)"),3500,0);
+    }
   }
   if (g_screen_off_at_us && now >= g_screen_off_at_us) {
     g_screen_off_at_us = 0;
     set_screen_off(true);
   }
   if (g_menu_open) {
+    if(g_page==kPageDownloads &&
+       ytv_native_download_revision()!=g_download_seen_revision)
+      refresh_download_list(); // disk scan on queue transition/completion only
     static uint64_t last_refresh = 0;  // clock, battery, timer minutes
     if (now - last_refresh > 1000000ull) { last_refresh = now; compose_panel(); }
   }
@@ -1288,18 +1914,12 @@ void ytv_addons_tick() {
       g_dropped_per_s = last_hud ? (int)(d - last_dropped) : 0;
       last_dropped = d;
       last_hud = now;
-      if (g_perf_hud || g_clock_hud) compose_hud();
+      if (g_perf_hud || g_clock_hud || g_timer_countdown_visible)
+        compose_hud();
       else g_hud_w = 0;
     }
   }
-  // Full HD guard: two minutes without a 1080p decoder also count as healthy.
-  {
-    static uint64_t start = 0;
-    if (!start) start = now;
-    extern volatile bool g_ytv_fhd_decoder_created;  // port_player.cpp
-    if (g_fhd_state == 1 && !g_ytv_fhd_decoder_created && now - start > 120000000ull)
-      ytv_addons_fhd_ok();
-  }
+  // Full HD guard is now scoped to an actual 1080p decoder, not app uptime.
   // Keep the system awake while audio plays: with the screen off only block
   // auto-suspend; otherwise also block dimming.
   static uint64_t last_tick = 0;
@@ -1314,11 +1934,28 @@ void ytv_addons_tick() {
     save_screenshot();
   }
   if (g_screen_off) black_idle(now);
-  else if (overlay_visible() && !g_ytv_graphics_ext_active) idle_paint(now);
-  else restore_idle_paint();
-  // With the Graphics extension available, the Cobalt GPU presents a fresh
-  // frame at <=33 ms. Writing directly to its display buffer concurrently
-  // is unsafe and was a second source of stale/stacked menu artifacts.
+  else if (overlay_visible() &&
+           (!g_ytv_graphics_ext_active ||
+            // Cobalt sometimes stops submitting any frame after media or
+            // navigation transitions while native input/audio still work.
+            // Only use the CPU emergency paint once >=1.5 seconds elapsed
+            // since the last real swap. Never race an actively drawing GPU.
+            (g_last_swap_us &&
+             (int64_t)(now-g_last_swap_us)>1500000)))
+  {
+    static uint64_t last_fallback_log=0;
+    if(now-last_fallback_log>5000000ull){
+      last_fallback_log=now;
+      char line[128];
+      snprintf(line,sizeof(line),
+        "YTV_ADDON_NO_SWAP_FALLBACK elapsed_ms=%llu page=%d\n",
+        (unsigned long long)((now-g_last_swap_us)/1000),(int)g_page);
+      log_line(line);
+    }
+    idle_paint(now);
+  }else restore_idle_paint();
+  // Emergency CPU paint is reserved for genuinely stalled frame submission.
+  // Cobalt continues to own GL and can resume normally after new input.
 }
 
 }  // extern "C"
@@ -1403,6 +2040,210 @@ void restore_attrib(GLuint i, const AttribState& a) {
 }
 }  // namespace
 
+// ---- v0.64 Vertical mode: rotated portrait video over the whole screen ----
+extern "C" void* ytv_player_vertical_acquire(unsigned tex[3], int* w, int* h, int* tw, int* th);
+extern "C" void ytv_player_vertical_release(void* t);
+extern "C" bool ytv_osk_active();
+void draw_quad(GLuint tex, int x, int y, int w, int h, float us, float vs, float alpha);
+namespace {
+GLuint g_yuv_prog = 0;
+GLint g_yuv_pos = -1, g_yuv_uv = -1;
+bool g_yuv_failed = false;
+volatile uint32_t g_vertical_drawn_ms = 0;  // last frame the vertical picture was drawn
+bool init_yuv_gl() {
+  static const char* vs =
+      "attribute vec2 a_pos;\n"
+      "attribute vec2 a_uv;\n"
+      "varying vec2 v_uv;\n"
+      "void main() { v_uv = a_uv; gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+  // The planes are GL_ALPHA textures (decoder memory, see port_player.cpp).
+  // BT.709, limited range (YouTube's H.264 streams).
+  static const char* fs =
+      "precision mediump float;\n"
+      "varying vec2 v_uv;\n"
+      "uniform sampler2D u_y;\n"
+      "uniform sampler2D u_u;\n"
+      "uniform sampler2D u_v;\n"
+      "void main() {\n"
+      "  float y = 1.1644 * (texture2D(u_y, v_uv).a - 0.0627);\n"
+      "  float u = texture2D(u_u, v_uv).a - 0.5;\n"
+      "  float v = texture2D(u_v, v_uv).a - 0.5;\n"
+      "  gl_FragColor = vec4(y + 1.7927 * v, y - 0.2132 * u - 0.5329 * v, y + 2.1124 * u, 1.0);\n"
+      "}\n";
+  GLuint v = compile(GL_VERTEX_SHADER, vs), f = compile(GL_FRAGMENT_SHADER, fs);
+  if (!v || !f) return false;
+  g_yuv_prog = glCreateProgram();
+  glAttachShader(g_yuv_prog, v);
+  glAttachShader(g_yuv_prog, f);
+  glBindAttribLocation(g_yuv_prog, 0, "a_pos");
+  glBindAttribLocation(g_yuv_prog, 1, "a_uv");
+  glLinkProgram(g_yuv_prog);
+  GLint ok = 0;
+  glGetProgramiv(g_yuv_prog, GL_LINK_STATUS, &ok);
+  if (!ok) return false;
+  g_yuv_pos = glGetAttribLocation(g_yuv_prog, "a_pos");
+  g_yuv_uv = glGetAttribLocation(g_yuv_prog, "a_uv");
+  glUseProgram(g_yuv_prog);
+  glUniform1i(glGetUniformLocation(g_yuv_prog, "u_y"), 0);
+  glUniform1i(glGetUniformLocation(g_yuv_prog, "u_u"), 1);
+  glUniform1i(glGetUniformLocation(g_yuv_prog, "u_v"), 2);
+  return g_yuv_pos >= 0 && g_yuv_uv >= 0;
+}
+// Whether the vertical picture should cover the screen this frame.
+bool vertical_wanted() {
+  const int mode = __atomic_load_n(&g_ytv_video_vertical_mode, __ATOMIC_RELAXED);
+  return (mode == 1 || mode == 2) && !g_menu_open && !g_screen_off && !ytv_osk_active();
+}
+// Draws the frame turned 90 degrees, fitted (aspect kept) to the screen.
+// Called with the overlay's GL state already saved. Returns true if drawn.
+bool draw_vertical_video() {
+  unsigned tex[3];
+  int w = 0, h = 0, tw = 0, th = 0;
+  void* ref = ytv_player_vertical_acquire(tex, &w, &h, &tw, &th);
+  if (!ref) return false;
+  bool drawn = false;
+  if (!g_yuv_prog && !g_yuv_failed && !init_yuv_gl()) {
+    g_yuv_failed = true;
+    log_line("YTV_LIFECYCLE_VIDEO_VERTICAL overlay=failed (shader)\n");
+  }
+  if (g_yuv_prog && !g_yuv_failed && w > 0 && h > 0 && tw > 0 && th > 0) {
+    const int mode = __atomic_load_n(&g_ytv_video_vertical_mode, __ATOMIC_RELAXED);
+    // Rotated picture is h x w on screen.
+    float dw = kScreenW, dh = (float)kScreenW * w / h;
+    if (dh > kScreenH) { dh = kScreenH; dw = (float)kScreenH * h / w; }
+    const float x0 = -dw / kScreenW, x1 = dw / kScreenW, y0 = -dh / kScreenH, y1 = dh / kScreenH;
+    const float us = (float)w / tw, vs = (float)h / th;
+    // Screen corners (bottom-left, bottom-right, top-left, top-right) and the
+    // source texel each shows. Clockwise: source top edge -> screen right.
+    float uv[8];
+    if (mode == 1) {
+      const float c[8] = {us, vs, us, 0.f, 0.f, vs, 0.f, 0.f};
+      memcpy(uv, c, sizeof(c));
+    } else {
+      const float c[8] = {0.f, 0.f, 0.f, vs, us, 0.f, us, vs};
+      memcpy(uv, c, sizeof(c));
+    }
+    static float verts[16];
+    const float pos[8] = {x0, y0, x1, y0, x0, y1, x1, y1};
+    for (int i = 0; i < 4; i++) {
+      verts[i * 4 + 0] = pos[i * 2]; verts[i * 4 + 1] = pos[i * 2 + 1];
+      verts[i * 4 + 2] = uv[i * 2]; verts[i * 4 + 3] = uv[i * 2 + 1];
+    }
+    // Black bars, then the picture.
+    glUseProgram(g_prog);
+    draw_quad(g_tex_black, 0, 0, kScreenW, kScreenH, 1.f, 1.f, 1.f);
+    glUseProgram(g_yuv_prog);
+    glDisable(GL_BLEND);
+    // The player's texture filter is used as is: changing parameters of the
+    // live video textures correlated with a hardware crash (port_player.cpp).
+    for (int i = 2; i >= 0; i--) {
+      glActiveTexture(GL_TEXTURE0 + i);
+      glBindTexture(GL_TEXTURE_2D, tex[i]);
+    }
+    glVertexAttribPointer((GLuint)g_yuv_pos, 2, GL_FLOAT, GL_FALSE, 16, verts);
+    glVertexAttribPointer((GLuint)g_yuv_uv, 2, GL_FLOAT, GL_FALSE, 16, verts + 2);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glEnable(GL_BLEND);
+    glUseProgram(g_prog);
+    drawn = true;
+    __atomic_store_n(&g_vertical_drawn_ms, (uint32_t)(now_us() / 1000), __ATOMIC_RELAXED);
+    static int logged_mode = 0;
+    if (logged_mode != mode) {
+      logged_mode = mode;
+      char line[120];
+      snprintf(line, sizeof(line), "YTV_LIFECYCLE_VIDEO_VERTICAL overlay=1 dir=%s picture=%dx%d\n",
+               mode == 1 ? "cw" : "ccw", w, h);
+      log_line(line);
+    }
+  }
+  ytv_player_vertical_release(ref);
+  return drawn;
+}
+}  // namespace
+
+// ---- v0.64 inverted screen ------------------------------------------------
+namespace {
+GLuint g_flip_fbo = 0, g_flip_tex = 0, g_flip_rb = 0;
+bool g_flip_failed = false;
+volatile bool g_flip_on = false;  // the frame being drawn goes to g_flip_fbo
+bool create_flip_target() {
+  GLint old_fb = 0, old_tex = 0, old_rb = 0;
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &old_fb);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex);
+  glGetIntegerv(GL_RENDERBUFFER_BINDING, &old_rb);
+  glGenTextures(1, &g_flip_tex);
+  glBindTexture(GL_TEXTURE_2D, g_flip_tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kScreenW, kScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glGenRenderbuffers(1, &g_flip_rb);
+  glBindRenderbuffer(GL_RENDERBUFFER, g_flip_rb);
+  glRenderbufferStorage(GL_RENDERBUFFER, 0x88F0 /*GL_DEPTH24_STENCIL8*/, kScreenW, kScreenH);
+  glGenFramebuffers(1, &g_flip_fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, g_flip_fbo);
+  // Depth/stencil BEFORE the color texture: vitaGL only flags the
+  // framebuffer in glFramebufferRenderbuffer and creates the depth/stencil
+  // surface when the color attachment is set (libvitaGL disassembly). In the
+  // other order Skia's stencil clips failed: text inside rounded boxes was
+  // missing.
+  glFramebufferRenderbuffer(GL_FRAMEBUFFER, 0x821A /*GL_DEPTH_STENCIL_ATTACHMENT*/,
+                            GL_RENDERBUFFER, g_flip_rb);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_flip_tex, 0);
+  const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+  glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)old_fb);
+  glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex);
+  glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)old_rb);
+  char line[96];
+  snprintf(line, sizeof(line), "YTV_LIFECYCLE_SCREEN_FLIP target status=0x%x\n", (unsigned)status);
+  log_line(line);
+  return status == GL_FRAMEBUFFER_COMPLETE;
+}
+}  // namespace
+// Default framebuffer for Cobalt and the overlay (port_graphics.cpp).
+extern "C" unsigned ytv_screen_fbo() { return g_flip_on ? g_flip_fbo : 0; }
+// After each swap (GL thread): choose where the next frame is drawn.
+extern "C" void ytv_addons_after_swap() {
+  const bool want = __atomic_load_n(&g_ytv_screen_flip, __ATOMIC_RELAXED) && !g_flip_failed;
+  if (want && !g_flip_fbo && !create_flip_target()) {
+    g_flip_failed = true;
+    log_line("YTV_LIFECYCLE_SCREEN_FLIP failed (framebuffer)\n");
+  }
+  const bool on = want && !g_flip_failed && g_flip_fbo;
+  if (on == g_flip_on) return;
+  // Cobalt keeps its framebuffer binding across frames: move it with us.
+  GLint fb = 0;
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+  const GLint old_default = g_flip_on ? (GLint)g_flip_fbo : 0;
+  g_flip_on = on;
+  if (fb == old_default) glBindFramebuffer(GL_FRAMEBUFFER, on ? g_flip_fbo : 0);
+}
+// Draws the offscreen frame onto the real screen turned 180 degrees.
+void draw_flipped_screen() {
+  // Corners bottom-left, bottom-right, top-left, top-right. The offscreen
+  // texture's first row is the bottom of the frame (GL convention); a 180
+  // degree turn shows texel (1-u, 1-v) where the frame had (u, v).
+  static float verts[16];
+  const float v[16] = {-1.f, -1.f, 1.f, 1.f,   1.f, -1.f, 0.f, 1.f,
+                       -1.f,  1.f, 1.f, 0.f,   1.f,  1.f, 0.f, 0.f};
+  memcpy(verts, v, sizeof(v));
+  glBindTexture(GL_TEXTURE_2D, g_flip_tex);
+  if (g_loc_alpha >= 0) glUniform1f(g_loc_alpha, 1.f);
+  glVertexAttribPointer((GLuint)g_loc_pos, 2, GL_FLOAT, GL_FALSE, 16, verts);
+  glVertexAttribPointer((GLuint)g_loc_uv, 2, GL_FLOAT, GL_FALSE, 16, verts + 2);
+  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+// Touch (port_input.cpp): rotation of the vertical picture shown right now,
+// 0 when it is not on screen (1 clockwise, 2 counter-clockwise).
+extern "C" int ytv_addons_vertical_dir() {
+  const uint32_t drawn = __atomic_load_n(&g_vertical_drawn_ms, __ATOMIC_RELAXED);
+  if (!drawn || (uint32_t)(now_us() / 1000) - drawn > 300) return 0;
+  const int mode = __atomic_load_n(&g_ytv_video_vertical_mode, __ATOMIC_RELAXED);
+  return mode == 1 || mode == 2 ? mode : 0;
+}
+
 // One textured quad in screen pixels (top-left origin); us/vs = texture extent.
 void draw_quad(GLuint tex, int x, int y, int w, int h, float us, float vs, float alpha) {
   static float verts[16];
@@ -1433,17 +2274,26 @@ extern "C" void ytv_addons_before_swap() {
   }
   g_last_swap_us = swap_now;
   const int dim = kDimLevels[g_dim_idx];
-  const bool hud = (g_perf_hud || g_clock_hud) && g_hud_w > 0;
+  const bool hud = (g_perf_hud || g_clock_hud || g_timer_countdown_visible) &&
+                   g_hud_w > 0;
   const bool panel = overlay_visible();
   const bool black = g_screen_off;
-  if (g_gl_failed || !g_img || (!panel && !dim && !hud && !black)) return;
+  const bool vertical = vertical_wanted();
+  const bool flip = g_flip_on;
+  if (g_gl_failed || !g_img || (!panel && !dim && !hud && !black && !vertical && !flip)) return;
   // Save the state Cobalt/Skia relies on BEFORE init_gl(): initialising the
   // overlay creates textures and changes GL_TEXTURE_BINDING_2D. Capturing state
   // only afterwards restored the overlay texture as Cobalt's texture, causing
   // corrupted thumbnails/textures after visiting Add-ons.
-  GLint prog, active, tex0, abuf, fbo, vp[4], sc[4], bsrc_rgb, bdst_rgb, bsrc_a, bdst_a, beq_rgb, beq_a;
+  GLint prog, active, tex0, tex1 = 0, tex2 = 0, abuf, fbo, vp[4], sc[4], bsrc_rgb, bdst_rgb, bsrc_a, bdst_a, beq_rgb, beq_a;
   glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
   glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+  if (vertical) {  // the YUV draw also uses texture units 1 and 2
+    glActiveTexture(GL_TEXTURE1);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex1);
+    glActiveTexture(GL_TEXTURE2);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex2);
+  }
   glActiveTexture(GL_TEXTURE0);
   glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex0);
   glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &abuf);
@@ -1471,7 +2321,7 @@ extern "C" void ytv_addons_before_swap() {
     goto restore_overlay_state;
   }
   glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
-  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glBindFramebuffer(GL_FRAMEBUFFER, ytv_screen_fbo());
   glViewport(0, 0, kScreenW, kScreenH);
   glDisable(GL_SCISSOR_TEST);
   glDisable(GL_DEPTH_TEST);
@@ -1485,12 +2335,15 @@ extern "C" void ytv_addons_before_swap() {
   glBindBuffer(GL_ARRAY_BUFFER, 0);
   glEnableVertexAttribArray((GLuint)g_loc_pos);
   glEnableVertexAttribArray((GLuint)g_loc_uv);
+  // 0. Vertical mode: the portrait video, rotated, over the whole screen.
+  if (vertical && draw_vertical_video()) glActiveTexture(GL_TEXTURE0);
   // 1. Internal darkening: black over the whole frame (not the backlight).
   //    "Black screen" mode: fully black, nothing else drawn on top.
   if (black) draw_quad(g_tex_black, 0, 0, kScreenW, kScreenH, 1.f, 1.f, 1.f);
   else if (dim) draw_quad(g_tex_black, 0, 0, kScreenW, kScreenH, 1.f, 1.f, dim / 100.f);
   // 2. HUD, top-right corner.
   if (hud && !black) {
+    pthread_mutex_lock(&g_overlay_image_lock);
     const int w = g_hud_w, h = g_hud_h;
     uint32_t gen = g_hud_gen;
     if (gen != g_hud_tex_gen) {
@@ -1498,10 +2351,17 @@ extern "C" void ytv_addons_before_swap() {
       glBindTexture(GL_TEXTURE_2D, g_tex_hud);
       glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, g_hud);
     }
+    pthread_mutex_unlock(&g_overlay_image_lock);
     draw_quad(g_tex_hud, kScreenW - w - 10, 10, w, h, (float)w / kHudW, (float)h / kHudH, 1.f);
   }
-  // 3. Menu / toast, centred.
+  // 3. Backdrop: draw one translucent black quad behind the OPEN menu.
+  // Reuses the existing black texture. Toasts are never dimmed.
+  if(g_menu_open && !black)
+    draw_quad(g_tex_black,0,0,kScreenW,kScreenH,1.f,1.f,
+              kMenuBackdropOpacity);
+  // 4. Menu / toast, centred.
   if (panel) {
+    pthread_mutex_lock(&g_overlay_image_lock);
     const int w = g_img_w, h = g_img_h;
     glBindTexture(GL_TEXTURE_2D, g_tex);
     uint32_t gen = g_img_gen;
@@ -1518,8 +2378,18 @@ extern "C" void ytv_addons_before_swap() {
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
+    pthread_mutex_unlock(&g_overlay_image_lock);
     draw_quad(g_tex, (kScreenW - w) / 2, (kScreenH - h) / 2, w, h, (float)w / kPanelW,
               (float)h / kPanelH, 1.f);
+  }
+
+  // 5. Inverted screen: everything above went to the offscreen frame; show
+  //    it on the real screen turned 180 degrees.
+  if (flip) {
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_BLEND);
+    glActiveTexture(GL_TEXTURE0);
+    draw_flipped_screen();
   }
 
   // Restore every state touched by the overlay, including the very first
@@ -1529,6 +2399,13 @@ restore_overlay_state:
   restore_attrib(1, a1);
   glBindBuffer(GL_ARRAY_BUFFER, (GLuint)abuf);
   glUseProgram((GLuint)prog);
+  if (vertical) {
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)tex2);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)tex1);
+    glActiveTexture(GL_TEXTURE0);
+  }
   glBindTexture(GL_TEXTURE_2D, (GLuint)tex0);
   glActiveTexture((GLenum)active);
   glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)fbo);

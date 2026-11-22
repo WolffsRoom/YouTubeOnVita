@@ -18,6 +18,7 @@ if(YTV_VITAGL_NOSPLASH)
 endif()
 include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 option(YTV_BUILD_STARBOARD15_PROBE "Build minimal real Starboard 15 Vita API test" ON)
+option(YTV_V8_JITLESS_DIAGNOSTIC "Crash diagnosis: disable V8 JIT (slower, not a proven fix)" OFF)
 if(YTV_BUILD_STARBOARD15_PROBE)
   set(ROOT "${CMAKE_CURRENT_SOURCE_DIR}/experiments/cobalt")
   set(SB "${ROOT}/upstream-25")
@@ -25,7 +26,15 @@ if(YTV_BUILD_STARBOARD15_PROBE)
   set(VITA_APP_NAME "Starboard Vita API Test")
   set(VITA_TITLEID "YTVSB0001")
   set(VITA_VERSION "00.02")
-  add_library(starboard_vita15 STATIC "${VITA}/platform15.cpp" "${VITA}/port_window.cpp" "${VITA}/pad_adapter.cpp" "${VITA}/import_lookup.cpp" "${VITA}/port_files.cpp" "${VITA}/port_sync.cpp" "${VITA}/port_network.cpp" "${VITA}/port_socket_waiter.cpp" "${VITA}/port_runtime.cpp" "${VITA}/port_threads.cpp" "${VITA}/port_graphics.cpp" "${VITA}/port_virtual_memory.cpp" "${VITA}/port_storage.cpp" "${VITA}/port_system.cpp" "${VITA}/port_events.cpp" "${VITA}/port_constants.cpp" "${VITA}/port_optional_unsupported.cpp" "${VITA}/port_media_policy.cpp" "${VITA}/port_misc_utility.cpp" "${VITA}/port_audio_sink.cpp" "${VITA}/port_lifecycle.cpp" "${VITA}/port_player.cpp" "${VITA}/port_input.cpp" "${VITA}/port_microphone.cpp" "${VITA}/port_addons.cpp" "${VITA}/port_downloads.cpp" "${VITA}/port_native_download.cpp" "${VITA}/port_mp4_aac.cpp" "${VITA}/port_download_metadata.cpp" "${VITA}/port_cover_4x3.cpp" "${VITA}/port_media_session.cpp" "${VITA}/port_osk.cpp" "${VITA}/port_ui_sound.cpp")
+  add_library(starboard_vita15 STATIC "${VITA}/platform15.cpp" "${VITA}/port_window.cpp" "${VITA}/pad_adapter.cpp" "${VITA}/import_lookup.cpp" "${VITA}/port_files.cpp" "${VITA}/port_sync.cpp" "${VITA}/port_network.cpp" "${VITA}/port_socket_waiter.cpp" "${VITA}/port_runtime.cpp" "${VITA}/port_threads.cpp" "${VITA}/port_graphics.cpp" "${VITA}/port_virtual_memory.cpp" "${VITA}/port_storage.cpp" "${VITA}/port_system.cpp" "${VITA}/port_events.cpp" "${VITA}/port_constants.cpp" "${VITA}/port_optional_unsupported.cpp" "${VITA}/port_media_policy.cpp" "${VITA}/port_misc_utility.cpp" "${VITA}/port_audio_sink.cpp" "${VITA}/port_lifecycle.cpp" "${VITA}/port_player.cpp" "${VITA}/port_input.cpp" "${VITA}/port_microphone.cpp" "${VITA}/port_addons.cpp" "${VITA}/port_downloads.cpp" "${VITA}/port_native_download.cpp" "${VITA}/port_native_mp3_stream.cpp" "${VITA}/port_native_mp4_stream.cpp" "${VITA}/port_mp4_aac.cpp" "${VITA}/port_download_metadata.cpp" "${VITA}/port_cover_4x3.cpp" "${VITA}/port_media_session.cpp" "${VITA}/port_osk.cpp" "${VITA}/port_ui_sound.cpp")
+  if(YTV_V8_JITLESS_DIAGNOSTIC)
+    target_compile_definitions(starboard_vita15 PRIVATE YTV_V8_JITLESS_DIAGNOSTIC=1)
+  endif()
+  option(YTV_V061_RX_CHUNKS "v0.61 diagnostic: chunk Cobalt executable mapping" OFF)
+  option(YTV_V061_THREE_CORES "v0.61 diagnostic: force 3 user CPU cores" OFF)
+  if(YTV_V061_THREE_CORES)
+    target_compile_definitions(starboard_vita15 PRIVATE YTV_V061_THREE_CORES=1)
+  endif()
   add_executable(ytv_sb15_probe "${VITA}/main_test.cpp")
   option(YTV_GL_TRACE "Diagnostic: log GL calls made through the Starboard GLES table" OFF)
   if(YTV_GL_TRACE)
@@ -374,11 +383,15 @@ if(YTV_BUILD_COBALT_BOOT_PROBE)
     set(VITA_TITLEID "YTVCB0001")
     set(YTV_DISTRIBUTION_VPK "YouTube.vpk")
   endif()
-  set(VITA_VERSION "00.58")
+  set(YTV_COBALT_APP_VERSION "00.63" CACHE STRING "YouTube on Vita VPK version")
+  set(VITA_VERSION "${YTV_COBALT_APP_VERSION}")
   add_executable(ytv_cobalt_boot experiments/cobalt/vita/relocate_elf.c
     experiments/cobalt/vita/port_startup_splash.c)
   target_compile_definitions(ytv_cobalt_boot PRIVATE
     YTV_COBALT_BOOT_STAGE=2 YTV_COBALT_DIAG_EVENT_CUTOFF=1)
+  if(YTV_V061_RX_CHUNKS)
+    target_compile_definitions(ytv_cobalt_boot PRIVATE YTV_V061_RX_CHUNKS=1)
+  endif()
   if(YTV_PACKAGE_LITE)
     target_compile_definitions(ytv_cobalt_boot PRIVATE YTV_LOWMEM=1)
   endif()
@@ -452,6 +465,16 @@ if(YTV_BUILD_COBALT_BOOT_PROBE)
     FILE experiments/cobalt/vita/assets/sounds/success.pcm sfx/ui/success.pcm
     FILE experiments/cobalt/vita/assets/sounds/error.pcm sfx/ui/error.pcm
     FILE experiments/cobalt/vita/assets/sounds/open.pcm sfx/ui/open.pcm
+    FILE experiments/cobalt/vita/assets/sounds/mic_on.pcm sfx/ui/mic_on.pcm
+    FILE experiments/cobalt/vita/assets/sounds/touch.pcm sfx/ui/touch.pcm
+    FILE experiments/cobalt/vita/assets/sounds/download_start.pcm sfx/ui/download_start.pcm
+    FILE experiments/cobalt/vita/assets/sounds/download_done.pcm sfx/ui/download_done.pcm
+    FILE experiments/cobalt/vita/assets/sounds/controls_lock.pcm sfx/ui/controls_lock.pcm
+    FILE experiments/cobalt/vita/assets/sounds/sleep_warning.pcm sfx/ui/sleep_warning.pcm
+    FILE experiments/cobalt/vita/assets/sounds/timer_enable.pcm sfx/ui/timer_enable.pcm
+    FILE experiments/cobalt/vita/assets/sounds/lock.pcm sfx/ui/lock.pcm
+    FILE experiments/cobalt/vita/assets/sounds/delete.pcm sfx/ui/delete.pcm
+    FILE experiments/cobalt/vita/assets/sounds/battery_low.pcm sfx/ui/battery_low.pcm
     FILE ${COBALT_CORE} libcobalt.so
     FILE ${YTV_COBALT_CA_BUNDLE} cacert.pem
     ${COBALT_BOOT_ASSET_FILES})
