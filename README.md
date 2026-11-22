@@ -191,15 +191,28 @@ The optional AdBlock filters a small list of advertising domains. It **cannot re
 
 Screenshots of the actual YouTube interface captured in **Vita3K**.
 
-| Home / browsing | YouTube Music |
+| Home / Browse | YouTube Music |
 |:--:|:--:|
-| <img src="assets/prints/2026-11-18-012317-271894.png" width="420" alt="YouTube interface"> | <img src="assets/prints/2026-11-18-012356-460699.png" width="420" alt="YouTube Music"> |
-| **Search** | **Player options** |
-| <img src="assets/prints/2026-11-18-012541-048063.png" width="420" alt="Search interface"> | <img src="assets/prints/2026-11-18-012601-518647.png" width="420" alt="YouTube player"> |
-| **Captions** | **Video quality** |
-| <img src="assets/prints/2026-11-18-012607-425442.png" width="420" alt="Subtitle settings"> | <img src="assets/prints/2026-11-18-012636-053045.png" width="420" alt="Video quality"> |
+| <img src="assets/prints/new/Home-Browse.png" width="420" alt="Home / Browse"> | <img src="assets/prints/new/YouTube%20Music.png" width="420" alt="YouTube Music"> |
 
-See [all screenshots](assets/prints/) or the [Wolff's Room release post](https://wolffsroom.github.io/WolffsRoomSite/#youtube-on-vita).
+| Search | Video playback |
+|:--:|:--:|
+| <img src="assets/prints/new/Search.png" width="420" alt="Search"> | <img src="assets/prints/new/Video.png" width="420" alt="Video playback"> |
+
+| Captions | Shorts |
+|:--:|:--:|
+| <img src="assets/prints/new/Captions.png" width="420" alt="Captions"> | <img src="assets/prints/new/Shorts.png" width="420" alt="Shorts"> |
+
+| Play Music | Lyrics |
+|:--:|:--:|
+| <img src="assets/prints/new/Play%20Music.png" width="420" alt="Play Music"> | <img src="assets/prints/new/Lyrics.png" width="420" alt="Lyrics"> |
+
+| Movies 1 | Movies 2 |
+|:--:|:--:|
+| <img src="assets/prints/new/Movies%201.png" width="420" alt="Movies 1"> | <img src="assets/prints/new/Movies%202.png" width="420" alt="Movies 2"> |
+
+See [all screenshots](assets/prints/new/) or the [Wolff's Room release post](https://wolffsroom.github.io/WolffsRoomSite/posts/youtube-on-vita/).
+
 
 ---
 
