@@ -162,21 +162,17 @@ Open **Add-ons** with **SELECT** or a three-finger tap. These tools extend the o
 | **Vita Settings** | System Settings shortcut (subject to available memory) |
 
 <table align="center">
-<tbody>
-<tr>
-<td align="center"><a href="assets/Add-ons/en/1-home.png"><img src="assets/Add-ons/en/1-home.png" alt="Add-ons" width="235"></a><br><sub>Add-ons</sub></td>
-<td align="center"><a href="assets/Add-ons/en/2-player-settings.png"><img src="assets/Add-ons/en/2-player-settings.png" alt="Player settings" width="235"></a><br><sub>Player settings</sub></td>
-<td align="center"><a href="assets/Add-ons/en/3-download.png"><img src="assets/Add-ons/en/3-download.png" alt="Download options" width="235"></a><br><sub>Download options</sub></td>
-</tr>
-<tr>
-<td align="center"><a href="assets/Add-ons/en/4-downloads.png"><img src="assets/Add-ons/en/4-downloads.png" alt="Downloads" width="235"></a><br><sub>Downloads</sub></td>
-<td align="center"><a href="assets/Add-ons/en/5-settings.png"><img src="assets/Add-ons/en/5-settings.png" alt="Settings" width="235"></a><br><sub>Settings</sub></td>
-<td align="center"><a href="assets/Add-ons/en/6-screen-and-info.png"><img src="assets/Add-ons/en/6-screen-and-info.png" alt="Screen & Info" width="235"></a><br><sub>Screen &amp; Info</sub></td>
-</tr>
-<tr>
-<td align="center"><a href="assets/Add-ons/en/7-no-internet.png"><img src="assets/Add-ons/en/7-no-internet.png" alt="No internet" width="235"></a><br><sub>No internet</sub></td>
-</tr>
-</tbody>
+  <tbody>
+    <tr>
+      <td align="center"><a href="assets/Add-ons/en/1-home.png"><img src="assets/Add-ons/en/1-home.png" alt="Add-ons" width="150"></a><br><sub>Add-ons</sub></td>
+      <td align="center"><a href="assets/Add-ons/en/2-player-settings.png"><img src="assets/Add-ons/en/2-player-settings.png" alt="Player settings" width="150"></a><br><sub>Player settings</sub></td>
+      <td align="center"><a href="assets/Add-ons/en/3-download.png"><img src="assets/Add-ons/en/3-download.png" alt="Download options" width="150"></a><br><sub>Download options</sub></td>
+      <td align="center"><a href="assets/Add-ons/en/4-downloads.png"><img src="assets/Add-ons/en/4-downloads.png" alt="Downloads" width="150"></a><br><sub>Downloads</sub></td>
+      <td align="center"><a href="assets/Add-ons/en/5-settings.png"><img src="assets/Add-ons/en/5-settings.png" alt="Settings" width="150"></a><br><sub>Settings</sub></td>
+      <td align="center"><a href="assets/Add-ons/en/6-screen-and-info.png"><img src="assets/Add-ons/en/6-screen-and-info.png" alt="Screen & Info" width="150"></a><br><sub>Screen &amp; Info</sub></td>
+      <td align="center"><a href="assets/Add-ons/en/7-no-internet.png"><img src="assets/Add-ons/en/7-no-internet.png" alt="No internet" width="150"></a><br><sub>No internet</sub></td>
+    </tr>
+  </tbody>
 </table>
 
 ### MP4 and MP3 downloads
@@ -211,7 +207,7 @@ Screenshots of the actual YouTube interface captured in **Vita3K**.
 |:--:|:--:|
 | <img src="assets/prints/new/Play%20Music.png" width="420" alt="Play Music"> | <img src="assets/prints/new/Lyrics.png" width="420" alt="Lyrics"> |
 
-| Movies 1 | Movies 2 |
+| Movies Player | Movies Trailer |
 |:--:|:--:|
 | <img src="assets/prints/new/Movies%201.png" width="420" alt="Movies 1"> | <img src="assets/prints/new/Movies%202.png" width="420" alt="Movies 2"> |
 
@@ -227,25 +223,28 @@ Cobalt is **not Chromium**. It is a Google-developed runtime for HTML5-based app
 The Vita port provides the **Starboard** implementation required to connect Cobalt to the console's operating system and hardware.
 
 ```text
-                YouTube on TV web application
-                  (HTML / CSS / JavaScript)
-                             |
-                      Cobalt Evergreen
-                   (V8 / Skia / web runtime)
-                             |
-                       Starboard 15
-                        PS Vita port
-            +----------------+----------------+
-            |                |                |
-        VitaGL / GXM    Network / TLS   Input / Files
-            |                |                |
-         SceGxm         Vita network     SceCtrl / Touch
-            |
-        SbPlayer / native media
-            |
-       SceAvcdec + SceAudiodec
-            |
-                     PlayStation Vita
+  YouTube on TV (HTML / CSS / JavaScript)
+                     |
+                     v
+  Cobalt Evergreen (V8 / Skia / Web Runtime)
+                     |
+                     v
+          Starboard 15 (PS Vita Port)
+                     |
+     +---------------+---------------+---------------+---------------+
+     |               |               |               |               |
+     v               v               v               v               v
+  Graphics        Network         Input / I/O     Native Media    System
+  VitaGL / GXM    HTTP / TLS       SceCtrl         SbPlayer        VitaSDK
+     |               |            SceTouch            |               |
+     v               v               v               v               v
+   SceGxm       Vita Network      SceIo           SceAvcdec     Vita Kernel
+                                                   SceAudiodec
+     |               |               |               |               |
+     +---------------+---------------+---------------+---------------+
+                                     |
+                                     v
+                              PlayStation Vita
 ```
 
 ### Native runtime and loader
@@ -403,7 +402,23 @@ Use the software responsibly, in accordance with applicable service terms and la
 
 <div align="center">
 
-**YouTubeOnVita**
+<div align="center">
+  <picture>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="https://github.com/user-attachments/assets/71d14b35-5d7d-43ef-a3bd-1371da640aae"
+    />
+    <source
+      media="(prefers-color-scheme: light)"
+      srcset="https://github.com/user-attachments/assets/e60897d8-5614-4b38-9751-020c74b78062"
+    />
+    <img
+      src="https://github.com/user-attachments/assets/e60897d8-5614-4b38-9751-020c74b78062"
+      alt="YouTube on PS Vita"
+      width="30%"
+    />
+  </picture>
+</div>
 
 *Unofficial client for PS Vita*
 
