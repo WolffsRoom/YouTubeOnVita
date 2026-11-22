@@ -35,7 +35,7 @@ _Unofficial client for PS Vita_
 <p align="center">
   <a href="#overview"><img src="https://img.shields.io/badge/PLATFORM-PS%20VITA-006fcd?style=for-the-badge&logo=playstation&logoColor=white" alt="Platform"></a>&nbsp;&nbsp;
   <a href="#how-it-works"><img src="https://img.shields.io/badge/ENGINE-COBALT%20%2B%20STARBOARD-455a64?style=for-the-badge" alt="Engine"></a>&nbsp;&nbsp;
-  <a href="#download"><img src="https://img.shields.io/badge/RELEASE-v0.58%20FULL%20%2B%20LITE-2ea44f?style=for-the-badge" alt="Latest Release"></a>&nbsp;&nbsp;
+  <a href="#download"><img src="https://img.shields.io/badge/RELEASE-v0.65%20FULL%20%2B%20LITE-2ea44f?style=for-the-badge" alt="Latest Release"></a>&nbsp;&nbsp;
   <a href="https://github.com/WolffsRoom/YouTubeOnVita/releases"><img src="https://img.shields.io/github/downloads/WolffsRoom/YouTubeOnVita/total?style=for-the-badge&color=blue&logo=github" alt="Total Downloads"></a>
 </p>
 
@@ -47,7 +47,6 @@ _Unofficial client for PS Vita_
   <em>If you enjoy my work, consider supporting the development!</em>
   <br>
 [<img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="48">](https://www.buymeacoffee.com/5rsrt7j4z8f)
-</div>
 </div>
 
 ---
@@ -84,12 +83,16 @@ _Unofficial client for PS Vita_
 
 ## Download
 
-**[YouTube on Vita v0.58 — First Release](https://github.com/WolffsRoom/YouTubeOnVita/releases/tag/v0.58)**
+**[YouTube on Vita v0.65](https://github.com/WolffsRoom/YouTubeOnVita/releases/tag/v0.65)** · [What's new](https://github.com/WolffsRoom/YouTubeOnVita/releases/tag/v0.65)
 
 | Version | Download | Memory | Recommended use |
 |:--|:--|:--|:--|
-| **YouTube Full** | **[YouTube.vpk](https://github.com/WolffsRoom/YouTubeOnVita/releases/download/v0.58/YouTube.vpk)** | Extended RAM | **Recommended:** more memory available to the player |
-| **YouTube Lite** | **[YouTube-Lite.vpk](https://github.com/WolffsRoom/YouTubeOnVita/releases/download/v0.58/YouTube-Lite.vpk)** | Normal RAM | Lower memory footprint, better coexistence with suspended applications |
+| **YouTube Full** | **[YouTube.vpk](https://github.com/WolffsRoom/YouTubeOnVita/releases/download/v0.65/YouTube.vpk)** | Extended RAM | **Recommended:** more memory available to the player |
+| **YouTube Lite** | **[YouTube-Lite.vpk](https://github.com/WolffsRoom/YouTubeOnVita/releases/download/v0.65/YouTube-Lite.vpk)** | Normal RAM | Lower memory footprint, better coexistence with suspended applications |
+
+> [!IMPORTANT]
+> **Requirement: kubridge v0.3.1 or newer** ([bythos14/kubridge](https://github.com/bythos14/kubridge/releases/latest)) in the `*KERNEL` section of `ur0:tai/config.txt`, then reboot.
+> The older kubridge v0.1 (TheOfficialFloW) lacks a memory function the app needs; it is the likely cause of a **crash right after the startup animation**.
 
 Install using **VitaShell**. Both editions can be installed side by side, with separate LiveArea bubbles (**YTVCB0001** / **YTVCB0002**). Settings and account-session data are stored in `ux0:data/youtubevita/`; do not delete this folder when updating.
 
@@ -101,8 +104,12 @@ Also available through **[Wolff's Room](https://wolffsroom.github.io/WolffsRoomS
 
 - The **real YouTube on TV** interface: browsing, search, sign-in and player controls.
 - Native **buttons, touchscreen and microphone integration**.
-- **H.264/AAC playback up to 720p**, including compatible 60 FPS streams; optional Full HD where supported.
-- Native **Add-ons** for screenshots, sleep timer, display and sound settings.
+- **H.264/AAC playback up to 720p**, including compatible 60 FPS streams and non-standard sizes (e.g. 1190×720); optional Full HD (beta).
+- **Shorts** playback, with a **Vertical mode** that turns the Vita sideways like a phone and swipes between Shorts.
+- **Aspect Ratio** (Original / Zoom / Stretch) and **Video filtering** (Bilinear / Nearest).
+- **Analog sticks:** left stick navigates; right stick sets volume and brightness.
+- Native **Add-ons** for screenshots, sleep timer, display, sound and screen-orientation settings.
+- Native **UI sounds**, notifications and an offline / reconnect screen.
 - **MP4 video and MP3 audio downloads** with square artwork on new MP3s.
 - **Encrypted local session data**, custom LiveArea and animated startup.
 
@@ -120,9 +127,11 @@ The Vita display is **960 × 544**, so 720p video is scaled down to fit. Some fo
 <tr><td align="center"><img src="assets/sony-buttons/circle.png" alt="circle" width="22"></td><td align="center">Back / close</td></tr>
 <tr><td align="center"><img src="assets/sony-buttons/square.png" alt="square" width="22"> <img src="assets/sony-buttons/triangle.png" alt="triangle" width="22"></td><td align="center">Context-dependent YouTube controls</td></tr>
 <tr><td align="center"><img src="assets/sony-buttons/Select.png" alt="Select" width="52"></td><td align="center">Open / close native Add-ons</td></tr>
-<tr><td align="center"><img src="assets/sony-buttons/touchpad.png" alt="touchpad" width="38"><br>Front touchscreen</td><td align="center">Tap: Select · Swipe: Navigate<br>Two-finger tap: Back · Three-finger tap: Add-ons</td></tr>
+<tr><td align="center"><img src="assets/sony-buttons/touchpad.png" alt="touchpad" width="38"><br>Front touchscreen</td><td align="center">Tap: Select · Swipe: Navigate<br>Two-finger tap: Back · Three-finger tap: Add-ons<br>Vertical mode: swipe = next / previous Short · tap = play / pause</td></tr>
+<tr><td align="center">Left stick</td><td align="center">Navigate (same as D-pad)</td></tr>
+<tr><td align="center">Right stick</td><td align="center">Right / Left: volume up / down<br>Up / Down: brightness up / down</td></tr>
 <tr><td align="center">L / R</td><td align="center">Player navigation (when enabled)</td></tr>
-<tr><td align="center"><img src="assets/sony-buttons/Start.png" alt="Start" width="52"></td><td align="center">Application-dependent</td></tr>
+<tr><td align="center"><img src="assets/sony-buttons/Start.png" alt="Start" width="52"></td><td align="center">During playback: Subtitles key (availability depends on the video)</td></tr>
 </tbody>
 </table>
 
@@ -146,10 +155,10 @@ Open **Add-ons** with **SELECT** or a three-finger tap. These tools extend the o
 
 | Section | Options |
 |:--|:--|
-| **Player settings** | Screenshots, sleep timer, Black Screen and Darken Screen |
-| **Download** | MP4 video or locally encoded MP3 audio |
-| **Settings** | Download quality, partial AdBlock, L/R controls, input lock and language |
-| **Screen and info** | Full HD option, performance, clock, battery and UI sounds |
+| **Player settings** | Download, screenshots, sleep timer (from 5 min), Black Screen, Darken Screen, Video filtering, Aspect Ratio and Vertical (Shorts) |
+| **Downloads** | MP4 video or locally encoded MP3 audio, saved list with 5 items per page |
+| **Settings** | Download quality and format, partial AdBlock, L/R controls, input lock, language and Inverted screen |
+| **Screen and info** | Full HD (beta), performance, clock, battery, UI sounds and UI sounds volume |
 | **Vita Settings** | System Settings shortcut (subject to available memory) |
 
 <table align="center">
@@ -240,7 +249,7 @@ The graphics implementation connects Cobalt's EGL/GLES expectations to **VitaGL*
 
 Cobalt supplies encoded media samples to the Vita's **SbPlayer** implementation, which uses the native H.264 decoder and submits YUV video surfaces to the GPU.
 
-The Vita's hardware decoder accepts compatible **1280 × 720** streams. Full HD is an optional mode and is not guaranteed on every device.
+The Vita's hardware decoder accepts compatible **1280 × 720** streams. Non-standard sizes (such as 1190 × 720, 240 × 426 or 720 × 720) are decoded into an aligned layout and cropped by the GPU, and portrait Shorts up to **480 × 854** use a dedicated portrait decoder. Full HD is an optional beta mode and is not guaranteed on every device.
 
 ### Audio
 
@@ -267,9 +276,12 @@ These measures help protect local data but do **not** make the client an officia
 ## Known Limitations
 
 > [!WARNING]
-> **v0.58:** Switching HD videos, particularly during MP3 downloads, can cause a crash. This issue is under investigation.
+> **v0.65:** A crash when switching videos (inside Cobalt's JavaScript engine, seen since v0.53) is still under investigation. Crash logs are welcome: since v0.65 the previous session's logs are kept as `cobalt_boot_prev.log` / `starboard15_prev.log`.
 
 - **YouTube Full** reserves more RAM; **Lite** leaves more available for suspended applications.
+- **Full HD (beta):** if no video plays with it enabled, turn it off in Add-ons.
+- **Vertical mode** covers the YouTube player controls (they still work, just hidden). **Inverted screen** is experimental.
+- Opening comments with Square is not available yet.
 - Certain video formats, DRM-protected content and Full HD streams may not work.
 - The YouTube service may change on uncertified devices.
 
@@ -333,6 +345,10 @@ After building, run `./tools/test_cobalt_boot_vita3k.ps1 -Seconds 90`. Diagnosti
 | **v0.34 – v0.55** | YouTube frontend integration, Add-ons, downloads and additional testing |
 | **v0.56 – v0.57** | Unified build experiments, HD playback diagnostics, animated startup and MP3 cover art |
 | **v0.58 - First Release** | **Public Full and Lite VPKs, new README, screenshots and GitHub release** |
+| **v0.59 – v0.61** | Video artifact fixes, Video filtering, Downloads pages, offline recovery, startup diagnostics |
+| **v0.62** | New startup animation, UI sounds and notifications, sleep timer HUD, Aspect Ratio, 1190×720 support |
+| **v0.63** | Analog stick controls, media volume and brightness, START = Subtitles |
+| **v0.65** | **Shorts + Vertical mode, Inverted screen, non-standard resolutions, Full HD rework, lag, UI-artifact, quality-switch crash and text-background fixes** |
 
 Older detailed technical notes are preserved in [Development Notes Archive](docs/DEVELOPMENT_NOTES_ARCHIVE.md).
 
@@ -348,7 +364,7 @@ This project builds upon the work of:
 - [VitaSDK](https://vitasdk.org/) - homebrew toolchain and Vita interfaces.
 - [vitaGL](https://github.com/Rinnegatamante/vitaGL) - Vita graphics integration.
 - [Vita3K](https://vita3k.org/) - emulator for development and captures.
-- [kubridge](https://github.com/TheOfficialFloW/kubridge) - kernel bridge used for executable-memory integration.
+- [kubridge](https://github.com/TheOfficialFloW/kubridge) and the [bythos14 fork](https://github.com/bythos14/kubridge) - kernel bridge used for executable-memory integration.
 
 ### AI NOTICE
 
@@ -374,7 +390,7 @@ Use the software responsibly, in accordance with applicable service terms and la
 
 *Unofficial client for PS Vita*
 
-*Real TV frontend. Native Vita integration. First Release v0.58.*
+*Real TV frontend. Native Vita integration. v0.65.*
 
 **Vita means life!**
 
