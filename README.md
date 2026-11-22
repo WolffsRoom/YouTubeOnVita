@@ -164,13 +164,17 @@ Open **Add-ons** with **SELECT** or a three-finger tap. These tools extend the o
 <table align="center">
 <tbody>
 <tr>
-<td align="center"><a href="assets/prints/addons-home.png"><img src="assets/prints/addons-home.png" alt="Native Add-ons main menu" width="235"></a><br><sub>Add-ons</sub></td>
-<td align="center"><a href="assets/prints/addons-player.png"><img src="assets/prints/addons-player.png" alt="Player settings" width="235"></a><br><sub>Player</sub></td>
-<td align="center"><a href="assets/prints/addons-download.png"><img src="assets/prints/addons-download.png" alt="MP4 and MP3 downloads" width="235"></a><br><sub>Downloads</sub></td>
+<td align="center"><a href="assets/Add-ons/en/1-home.png"><img src="assets/Add-ons/en/1-home.png" alt="Add-ons" width="235"></a><br><sub>Add-ons</sub></td>
+<td align="center"><a href="assets/Add-ons/en/2-player-settings.png"><img src="assets/Add-ons/en/2-player-settings.png" alt="Player settings" width="235"></a><br><sub>Player settings</sub></td>
+<td align="center"><a href="assets/Add-ons/en/3-download.png"><img src="assets/Add-ons/en/3-download.png" alt="Download options" width="235"></a><br><sub>Download options</sub></td>
 </tr>
 <tr>
-<td align="center"><a href="assets/prints/addons-settings.png"><img src="assets/prints/addons-settings.png" alt="Settings" width="235"></a><br><sub>Settings</sub></td>
-<td align="center"><a href="assets/prints/addons-display.png"><img src="assets/prints/addons-display.png" alt="Screen and information" width="235"></a><br><sub>Screen &amp; Info</sub></td>
+<td align="center"><a href="assets/Add-ons/en/4-downloads.png"><img src="assets/Add-ons/en/4-downloads.png" alt="Downloads" width="235"></a><br><sub>Downloads</sub></td>
+<td align="center"><a href="assets/Add-ons/en/5-settings.png"><img src="assets/Add-ons/en/5-settings.png" alt="Settings" width="235"></a><br><sub>Settings</sub></td>
+<td align="center"><a href="assets/Add-ons/en/6-screen-and-info.png"><img src="assets/Add-ons/en/6-screen-and-info.png" alt="Screen & Info" width="235"></a><br><sub>Screen &amp; Info</sub></td>
+</tr>
+<tr>
+<td align="center"><a href="assets/Add-ons/en/7-no-internet.png"><img src="assets/Add-ons/en/7-no-internet.png" alt="No internet" width="235"></a><br><sub>No internet</sub></td>
 </tr>
 </tbody>
 </table>
