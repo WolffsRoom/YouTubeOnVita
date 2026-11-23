@@ -83,18 +83,26 @@ _Unofficial client for PS Vita_
 
 ## Download
 
-**[YouTube on Vita v0.65](https://github.com/WolffsRoom/YouTubeOnVita/releases/tag/v0.65)** · [What's new](https://github.com/WolffsRoom/YouTubeOnVita/releases/tag/v0.65)
+**[YouTube on Vita v0.66](https://github.com/WolffsRoom/YouTubeOnVita/releases/tag/v0.66)** · [What's new](https://github.com/WolffsRoom/YouTubeOnVita/releases/tag/v0.66)
 
 | Version | Download | Memory | Recommended use |
 |:--|:--|:--|:--|
-| **YouTube Full** | **[YouTube.vpk](https://github.com/WolffsRoom/YouTubeOnVita/releases/download/v0.65/YouTube.vpk)** | Extended RAM | **Recommended:** more memory available to the player |
-| **YouTube Lite** | **[YouTube-Lite.vpk](https://github.com/WolffsRoom/YouTubeOnVita/releases/download/v0.65/YouTube-Lite.vpk)** | Normal RAM | Lower memory footprint, better coexistence with suspended applications |
+| **YouTube Full** | **[YouTube.vpk](https://github.com/WolffsRoom/YouTubeOnVita/releases/download/v0.66/YouTube.vpk)** | Extended RAM | **Recommended:** more memory available to the player |
+| **YouTube Lite** | **[YouTube-Lite.vpk](https://github.com/WolffsRoom/YouTubeOnVita/releases/download/v0.66/YouTube-Lite.vpk)** | Normal RAM | Lower memory footprint, better coexistence with suspended applications |
 
-> [!IMPORTANT]
-> **Requirement: kubridge v0.3.1 or newer** ([bythos14/kubridge](https://github.com/bythos14/kubridge/releases/latest)) in the `*KERNEL` section of `ur0:tai/config.txt`, then reboot.
-> The older kubridge v0.1 (TheOfficialFloW) lacks a memory function the app needs; it is the likely cause of a **crash right after the startup animation**.
+### Requirements
 
-Install using **VitaShell**. Both editions can be installed side by side, with separate LiveArea bubbles (**YTVCB0001** / **YTVCB0002**). Settings and account-session data are stored in `ux0:data/youtubevita/`; do not delete this folder when updating.
+- **kubridge v0.3.1 or newer** ([bythos14/kubridge](https://github.com/bythos14/kubridge/releases/latest)) in the `*KERNEL` section of `ur0:tai/config.txt`, then reboot. The older kubridge v0.1 (TheOfficialFloW) lacks a memory function the app needs.
+- **libshacccg: `ur0:data/libshacccg.suprx`** (the system shader compiler, extracted with [ShaRKF00D](https://github.com/Rinnegatamante/ShaRKF00D)). The app ships its shaders precompiled, but any shader missing from that set needs the compiler.
+
+### Install and update
+
+Install using **FMVita/VitaShell** or the [**Wolff's Store**](https://wolffsroom.github.io/WolffsRoomSite/).
+Both editions can be installed side by side, with separate LiveArea bubbles (**YTVCB0001** / **YTVCB0002**). To update, install the new VPK over the old one. Settings and account-session data are stored in `ux0:data/youtubevita/`. Do not delete this folder when updating.
+
+> [!TIP]
+> **Crash right after the startup animation?**
+> Check both requirements above. To report a crash, attach only `cobalt_boot.log`, `starboard15.log` and the `*_prev.log` files from `ux0:data/youtubevita/`, plus the newest `psp2core-*.psp2dmp` crash dump (usually in `ux0:data/`).
 
 Also available through **[Wolff's Room](https://wolffsroom.github.io/WolffsRoomSite/#youtube-on-vita)** and the Wolff's Store app.
 
