@@ -57,7 +57,7 @@ _Unofficial client for PS Vita_
 <summary><b>Project and Features</b></summary>
 
 - [Overview](#overview)
-- [Download — Full & Lite](#download)
+- [Download — Full or Lite](#download)
 - [Features](#features)
 - [Controls](#controls)
 - [Cobalt and  FPS](#cobalt-and-fps)
@@ -83,12 +83,10 @@ _Unofficial client for PS Vita_
 
 ## Download
 
-**[YouTube on Vita v0.66](https://github.com/WolffsRoom/YouTubeOnVita/releases/tag/v0.66)** · [What's new](https://github.com/WolffsRoom/YouTubeOnVita/releases/tag/v0.66)
-
 | Version | Download | Memory | Recommended use |
 |:--|:--|:--|:--|
-| **YouTube Full** | **[YouTube.vpk](https://github.com/WolffsRoom/YouTubeOnVita/releases/download/v0.66/YouTube.vpk)** | Extended RAM | **Recommended:** more memory available to the player |
-| **YouTube Lite** | **[YouTube-Lite.vpk](https://github.com/WolffsRoom/YouTubeOnVita/releases/download/v0.66/YouTube-Lite.vpk)** | Normal RAM | Lower memory footprint, better coexistence with suspended applications |
+| **YouTube Full** | **[YouTube.vpk](https://github.com/WolffsRoom/YouTubeOnVita/releases/download/v0.65/YouTube.vpk)** | Extended RAM | **Recommended:** more memory available to the player |
+| **YouTube Lite** | **[YouTube-Lite.vpk](https://github.com/WolffsRoom/YouTubeOnVita/releases/download/v0.65/YouTube-Lite.vpk)** | Normal RAM | Lower memory footprint, better coexistence with suspended applications |
 
 ### Requirements
 
@@ -177,7 +175,7 @@ Open **Add-ons** with **SELECT** or a three-finger tap. These tools extend the o
       <td align="center"><a href="assets/Add-ons/en/3-download.png"><img src="assets/Add-ons/en/3-download.png" alt="Download options" width="150"></a><br><sub>Download options</sub></td>
       <td align="center"><a href="assets/Add-ons/en/4-downloads.png"><img src="assets/Add-ons/en/4-downloads.png" alt="Downloads" width="150"></a><br><sub>Downloads</sub></td>
       <td align="center"><a href="assets/Add-ons/en/5-settings.png"><img src="assets/Add-ons/en/5-settings.png" alt="Settings" width="150"></a><br><sub>Settings</sub></td>
-      <td align="center"><a href="assets/Add-ons/en/6-screen-and-info.png"><img src="assets/Add-ons/en/6-screen-and-info.png" alt="Screen & Info" width="150"></a><br><sub>Screen &amp; Info</sub></td>
+      <td align="center"><a href="assets/Add-ons/en/6-screen-and-info.png"><img src="assets/Add-ons/en/6-screen-and-info.png" alt="Screen and Info" width="150"></a><br><sub>Screen &amp; Info</sub></td>
       <td align="center"><a href="assets/Add-ons/en/7-no-internet.png"><img src="assets/Add-ons/en/7-no-internet.png" alt="No internet" width="150"></a><br><sub>No internet</sub></td>
     </tr>
   </tbody>
