@@ -120,21 +120,13 @@ void* SbMemoryMap(int64_t size_bytes,int flags,const char *name) {
     sceKernelFreeMemBlock(uid);
     return SB_MEMORY_MAP_FAILED;
   }
-  // Read-only mappings are protected; "reserved" (flags == 0) mappings are
-  // NOT: they stay RW. A Vita memblock is committed anyway, so PROT_NONE
-  // saved nothing, and it was the cause of the recurring V8 data aborts
-  // (v0.25, v0.29, first-login crash, Lite v0.45, v0.47 at video start: a
-  // translation fault, DFSR=7, on a page of such a block that V8 had already
-  // committed and put objects on). Sub-range permission changes on a live
-  // memblock are not reliable through kuKernelMemProtect.
-  if(flags==kSbMemoryMapProtectRead) {
-    int pr=kuKernelMemProtect(base,(SceSize)size,prot(flags));
-    if(pr<0) {
-      vm_log("YTV_LIFECYCLE_VM_MAP_FAIL n=%d reason=protect err=0x%x flags=%d\n",num,(unsigned)pr,flags);
-      sceKernelFreeMemBlock(uid);
-      return SB_MEMORY_MAP_FAILED;
-    }
-  }
+  // EXPERIMENTAL: the Vita's data-mapping SbMemoryProtect() currently
+  // acknowledges ReadWrite transitions without changing kernel permissions.
+  // Initially applying RO here can leave a mapping RO even after the caller
+  // believes it has become RW. Keep non-executable mappings RW consistently.
+  // This relaxes data-page write protection and is NOT a proven fix for
+  // the reported V8 translation abort (DFSR=7). Test on hardware first.
+  // Executable JIT transitions still use real protection in SbMemoryProtect().
   pthread_mutex_lock(&lock);
   int index=-1;
   for(int i=0;i<kMaxMaps;i++)if(!maps[i].base){index=i;break;}
