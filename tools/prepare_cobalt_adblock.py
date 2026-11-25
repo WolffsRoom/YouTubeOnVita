@@ -32,7 +32,7 @@ def main():
     # Vita Starboard's already-supported file API is used; the Cobalt binary
     # does not import any new custom/private symbols or read a different app.
     includes = '#include <cstring>\n#include "starboard/file.h"\n'
-    patch = """
+    patch = r"""
   // YTV_OPTIONAL_ADBLOCK_PRELOAD
   // No filtering unless the user enabled AdBlock in native settings.
   // The native menu's DNS filter updates immediately; this JS layer reads
