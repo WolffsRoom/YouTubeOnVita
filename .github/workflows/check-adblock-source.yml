@@ -1,0 +1,36 @@
+name: Test opt-in advanced AdBlock source patch
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tools/prepare_cobalt_adblock.py'
+      - 'tools/cobalt_adblock_preload.js'
+      - 'tools/test_cobalt_adblock.cjs'
+      - 'tools/test_advanced_adblock_source.cjs'
+      - '.github/workflows/check-adblock-source.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Static and synthetic tests
+        run: |
+          set -euo pipefail
+          python3 -m py_compile tools/prepare_cobalt_adblock.py
+          node tools/test_cobalt_adblock.cjs
+          node tools/test_advanced_adblock_source.cjs
+      - name: Validate patch against the exact upstream Cobalt 25 source
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --single-branch --branch 25.lts.50 https://github.com/youtube/cobalt.git cobalt-src
+          test "$(git -C cobalt-src rev-parse HEAD)" = 762d9bfda894dd22cc5d47200f9994c3027514eb
+          python3 tools/prepare_cobalt_adblock.py cobalt-src
+          git -C cobalt-src diff --check
+          grep -Fq 'YTV_OPTIONAL_ADBLOCK_PRELOAD' cobalt-src/cobalt/browser/web_module.cc
+          grep -Fq 'ux0:data/youtubevita/addons.cfg' cobalt-src/cobalt/browser/web_module.cc
