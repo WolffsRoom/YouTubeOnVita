@@ -373,6 +373,8 @@ endif()
 # side by side. Prefer the normal package unless background apps are important.
 option(YTV_PACKAGE_LITE "Build normal-memory YouTube Lite (YTVCB0002)" OFF)
 option(YTV_BUILD_COBALT_BOOT_PROBE "Build native Cobalt YouTube" ON)
+# Optional only: the default always packages upstream's unmodified libcobalt.so.
+set(YTV_CUSTOM_COBALT_DIR "" CACHE PATH "Validated, source-built experimental Cobalt runtime/content/profile directory")
 if(YTV_BUILD_COBALT_BOOT_PROBE)
   if(YTV_PACKAGE_LITE)
     set(VITA_APP_NAME "YouTube Lite")
@@ -385,10 +387,26 @@ if(YTV_BUILD_COBALT_BOOT_PROBE)
   endif()
   set(YTV_COBALT_APP_VERSION "00.63" CACHE STRING "YouTube on Vita VPK version")
   set(VITA_VERSION "${YTV_COBALT_APP_VERSION}")
+  if(YTV_CUSTOM_COBALT_DIR)
+    if(NOT EXISTS "${YTV_CUSTOM_COBALT_DIR}/libcobalt.so" OR
+       NOT EXISTS "${YTV_CUSTOM_COBALT_DIR}/cobalt_candidate_profile.h" OR
+       NOT IS_DIRECTORY "${YTV_CUSTOM_COBALT_DIR}/content")
+      message(FATAL_ERROR "Incomplete experimental Cobalt runtime/profile/content directory")
+    endif()
+    # Only the opt-in package replaces the official libcobalt.so and content.
+    set(COBALT_CORE "${YTV_CUSTOM_COBALT_DIR}/libcobalt.so")
+    message(WARNING "EXPERIMENTAL Cobalt source build selected: ${COBALT_CORE}")
+  endif()
   add_executable(ytv_cobalt_boot experiments/cobalt/vita/relocate_elf.c
     experiments/cobalt/vita/port_startup_splash.c)
   target_compile_definitions(ytv_cobalt_boot PRIVATE
-    YTV_COBALT_BOOT_STAGE=2 YTV_COBALT_DIAG_EVENT_CUTOFF=1)
+    YTV_COBALT_BOOT_STAGE=2)
+  if(YTV_CUSTOM_COBALT_DIR)
+    target_compile_definitions(ytv_cobalt_boot PRIVATE YTV_CUSTOM_COBALT=1)
+    target_include_directories(ytv_cobalt_boot PRIVATE "${YTV_CUSTOM_COBALT_DIR}")
+  else()
+    target_compile_definitions(ytv_cobalt_boot PRIVATE YTV_COBALT_DIAG_EVENT_CUTOFF=1)
+  endif()
   if(YTV_V061_RX_CHUNKS)
     target_compile_definitions(ytv_cobalt_boot PRIVATE YTV_V061_RX_CHUNKS=1)
   endif()
@@ -411,6 +429,9 @@ if(YTV_BUILD_COBALT_BOOT_PROBE)
   vita_create_self(ytv_cobalt_boot.self ytv_cobalt_boot UNSAFE)
   # Package only content actually extracted from the matching official CRX.
   set(COBALT_EXTRACTED_CONTENT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/experiments/cobalt/evergreen/core25/content")
+  if(YTV_CUSTOM_COBALT_DIR)
+    set(COBALT_EXTRACTED_CONTENT_DIR "${YTV_CUSTOM_COBALT_DIR}/content")
+  endif()
   file(GLOB_RECURSE COBALT_BOOT_ASSETS CONFIGURE_DEPENDS
        "${COBALT_EXTRACTED_CONTENT_DIR}/*")
   set(COBALT_BOOT_ASSET_FILES "")

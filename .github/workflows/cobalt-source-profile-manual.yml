@@ -1,0 +1,70 @@
+name: Experimental source-built Cobalt loader profile (manual only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-built-cobalt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify unmodified default Cobalt packaging
+        run: |
+          node tools/test_optional_cobalt_default.cjs
+          python3 -m py_compile tools/prepare_vita_cobalt_profile.py
+      - name: Free space for pinned Cobalt toolchains
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h
+      - name: Fetch exact upstream Cobalt 25.50 source WITHOUT patches
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch 25.lts.50 --single-branch https://github.com/youtube/cobalt.git cobalt-src
+          test "$(git -C cobalt-src rev-parse HEAD)" = 762d9bfda894dd22cc5d47200f9994c3027514eb
+          git -C cobalt-src diff --exit-code
+      - name: Build the upstream Evergreen ARM hard-float toolchain
+        working-directory: cobalt-src
+        run: |
+          set -euo pipefail
+          export SB_API_VERSION=15
+          docker compose build --pull --build-arg BASE_OS=docker.io/library/debian --build-arg BASE_OS_TAG=bookworm base
+          docker compose build build-base
+          docker compose build build-evergreen
+      - name: Compile unmodified upstream Cobalt from source
+        working-directory: cobalt-src
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/code" -w /code -e PYTHONPATH=/code -e IS_CI=1 cobalt-build-evergreen bash -c '
+            set -euo pipefail
+            command -v python >/dev/null || ln -s "$(command -v python3)" /usr/local/bin/python
+            gn gen out/evergreen-arm-hardfp_upstream --args="target_platform=\"evergreen-arm-hardfp\" target_cpu=\"arm\" target_os=\"linux\" build_with_separate_cobalt_toolchain=false use_asan=false sb_api_version=15 is_internal_build=false build_type=\"gold\""
+            ninja -C out/evergreen-arm-hardfp_upstream -j 4 cobalt_install
+          '
+      - name: Stage exact runtime, content and loader ABI reports
+        run: |
+          set -euo pipefail
+          runtime=cobalt-src/out/evergreen-arm-hardfp_upstream/install/lib/libcobalt.so
+          test -s "$runtime"
+          mkdir -p candidate
+          readelf -h "$runtime" > candidate/elf-header.txt
+          readelf -lW "$runtime" > candidate/elf-segments.txt
+          readelf -rW "$runtime" > candidate/elf-relocations.txt
+          readelf --dyn-syms --wide "$runtime" > candidate/elf-symbols.txt
+          test -d cobalt-src/out/evergreen-arm-hardfp_upstream/install/usr/share/cobalt
+          cp "$runtime" candidate/libcobalt.so
+          cp -a cobalt-src/out/evergreen-arm-hardfp_upstream/install/usr/share/cobalt candidate/content
+          python3 -m venv "$RUNNER_TEMP/profile-venv"
+          "$RUNNER_TEMP/profile-venv/bin/pip" install 'pyelftools==0.32'
+          "$RUNNER_TEMP/profile-venv/bin/python" tools/prepare_vita_cobalt_profile.py \
+            candidate/libcobalt.so candidate/cobalt_candidate_profile.h
+          (cd candidate && sha256sum libcobalt.so > SHA256SUMS)
+          printf '%s\n' 'Experimental source-built runtime/profile. NOT a VPK. No upstream default change, no adblock or SponsorBlock patches. Requires Vita hardware validation before installation.' > candidate/README.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: experimental-source-cobalt-vita-loader-profile-NOT-VPK
+          path: candidate/
+          if-no-files-found: error
