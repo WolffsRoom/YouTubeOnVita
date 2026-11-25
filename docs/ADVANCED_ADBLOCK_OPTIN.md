@@ -25,6 +25,6 @@ The patch reads only `ux0:data/youtubevita/addons.cfg` through the standard Star
 
 Run `node tools/test_cobalt_adblock.cjs` and `node tools/test_advanced_adblock_source.cjs` for synthetic source-level tests. To validate end-to-end, build a modified `libcobalt.so` against the pinned Cobalt 25 source, generate a matching loader profile, package a test-only VPK, and test on an actual PS Vita.
 
-Test both options off and on, restart between changes, compare advertisement playback in multiple video/Shorts contexts, monitor stream compatibility, and preserve redacted logs. **No claim of 100% ad blocking or hardware validation is made.** YouTube can change its server responses and bypass known ad-field filters.
+The integrated fork has already been tested by its developer on a **physical PS Vita**, including its experimental ad-filtering behavior. However, this **extracted upstream-compatible opt-in patch** still needs an independent end-to-end check with its exact separately built binary. Test both options off and on, restart between changes, compare advertisement playback in multiple video/Shorts contexts, monitor stream compatibility, and preserve redacted logs. **No claim of 100% ad blocking or independent hardware validation of this isolated patch is made.** YouTube can change its server responses and bypass known ad-field filters.
 
 The PR remains a draft until maintainers validate the source-built binary and complete hardware tests.
