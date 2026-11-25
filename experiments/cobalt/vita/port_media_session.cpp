@@ -6,6 +6,8 @@
  */
 #include "starboard/extension/media_session.h"
 #include "starboard/log.h"
+#include "starboard/event.h"
+#include <pthread.h>
 #include <cstdio>
 #include <cstring>
 #include <cctype>
@@ -14,8 +16,64 @@ extern "C" bool ytv_native_download_set_video(const char*);
 extern "C" bool ytv_native_download_set_artwork(const char*,const char*);
 extern "C" bool ytv_native_download_artwork_valid(const char*);
 extern "C" void ytv_native_download_clear_video();
+extern "C" int g_ytv_adblock_enabled;
 
 namespace {
+// One pending asynchronous Skipad action at a time. Cobalt may not be safely
+// reentered from inside its MediaSession update callback or a network thread.
+pthread_mutex_t skip_mutex=PTHREAD_MUTEX_INITIALIZER;
+void* skip_context=nullptr;
+CobaltExtensionMediaSessionInvokeActionCallback skip_invoke=nullptr;
+SbEventId skip_event=0;
+unsigned skip_generation=0;
+unsigned skip_pending_generation=0;
+bool skip_requested=false;
+
+void cancel_skip_locked() {
+  if(skip_event) SbEventCancel(skip_event);
+  skip_event=0;
+  skip_pending_generation=0;
+}
+
+void skip_ad_on_event_loop(void*) {
+  CobaltExtensionMediaSessionInvokeActionCallback invoke=nullptr;
+  void* context=nullptr;
+  pthread_mutex_lock(&skip_mutex);
+  if(skip_invoke && skip_pending_generation==skip_generation &&
+     __atomic_load_n(&g_ytv_adblock_enabled,__ATOMIC_RELAXED)) {
+    invoke=skip_invoke;
+    context=skip_context;
+  }
+  // Clear the queued state before invoking Cobalt, and never call back while
+  // the lock is held. The callback may synchronously update MediaSession.
+  skip_event=0;
+  skip_pending_generation=0;
+  pthread_mutex_unlock(&skip_mutex);
+  if(invoke) {
+    CobaltExtensionMediaSessionActionDetails details;
+    CobaltExtensionMediaSessionActionDetailsInit(
+      &details,kCobaltExtensionMediaSessionActionSkipad);
+    invoke(details,context);
+    SbLogRaw("YTV_ADBLOCK Skipad dispatched on event loop\n");
+  }
+}
+void maybe_schedule_skip_ad(const CobaltExtensionMediaSessionState& state) {
+  pthread_mutex_lock(&skip_mutex);
+  const bool available =
+    state.actual_playback_state!=kCobaltExtensionMediaSessionNone &&
+    state.available_actions[kCobaltExtensionMediaSessionActionSkipad];
+  if(!available) {
+    skip_requested=false;
+    cancel_skip_locked();
+  } else if(!skip_requested && !skip_event && skip_invoke &&
+            __atomic_load_n(&g_ytv_adblock_enabled,__ATOMIC_RELAXED)) {
+    skip_pending_generation=skip_generation;
+    skip_event=SbEventSchedule(skip_ad_on_event_loop,nullptr,0);
+    if(skip_event) skip_requested=true;
+    else skip_pending_generation=0;
+  }
+  pthread_mutex_unlock(&skip_mutex);
+}
 bool video_from_artwork(const char* src,char output[12]){
   if(!src || strncmp(src,"https://",8)!=0)return false;
   const char*host=src+8;
@@ -45,6 +103,7 @@ bool video_from_artwork(const char* src,char output[12]){
   return true;
 }
 void on_update(CobaltExtensionMediaSessionState state){
+  maybe_schedule_skip_ad(state);
   static int last_state=-1;
   const int playback=(int)state.actual_playback_state;
   if(last_state!=playback){
@@ -104,11 +163,25 @@ void on_update(CobaltExtensionMediaSessionState state){
     }
   }
 }
-void register_callbacks(void*,CobaltExtensionMediaSessionInvokeActionCallback,
+void register_callbacks(void* context,CobaltExtensionMediaSessionInvokeActionCallback invoke,
                         CobaltExtensionMediaSessionUpdatePlatformPlaybackStateCallback){
+  pthread_mutex_lock(&skip_mutex);
+  ++skip_generation;
+  cancel_skip_locked();
+  skip_requested=false;
+  skip_context=context;
+  skip_invoke=invoke;
+  pthread_mutex_unlock(&skip_mutex);
   SbLogRaw("YTV_MEDIA_SESSION_CALLBACK_REGISTERED\n");
 }
 void destroy_callbacks(){
+  pthread_mutex_lock(&skip_mutex);
+  ++skip_generation;
+  cancel_skip_locked();
+  skip_requested=false;
+  skip_invoke=nullptr;
+  skip_context=nullptr;
+  pthread_mutex_unlock(&skip_mutex);
   ytv_native_download_clear_video();
   SbLogRaw("YTV_MEDIA_SESSION_CALLBACK_DESTROYED\n");
 }
