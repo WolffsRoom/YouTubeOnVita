@@ -11,7 +11,12 @@ assert.ok(cb.indexOf('pthread_mutex_unlock(&sb_mutex)')<cb.indexOf('invoke(actio
           'must release lock before invoking Cobalt');
 assert.ok(!/kSbSkipAd|YTV_ADBLOCK|g_ytv_adblock/.test(media),
           'no adblocking implementation in SponsorBlock MediaSession integration');
-assert.ok(menu.includes('if (g_page == kPageSettings) return 9;'));
+assert.ok(menu.includes('kPageTweaks'));
+assert.ok(menu.includes('T("Tweaks", "Modificações")'));
+assert.ok(menu.includes('if (g_page == kPageTweaks) return 3;'));
+assert.ok(menu.includes('if(g_sel==0) toggle_adblock();'));
+assert.ok(menu.includes('g_ytv_adblock_enabled = 0'));
+assert.ok(menu.includes('case 6: open_page(kPageTweaks);break;'));
 assert.ok(menu.includes('sponsorblock=%d'));
 assert.ok(menu.includes('if (const char* v=strstr(buf,"sponsorblock="))'));
 assert.ok(menu.includes('case 7:') && menu.includes('g_ytv_sponsorblock_mode,mode,__ATOMIC_RELAXED'));
