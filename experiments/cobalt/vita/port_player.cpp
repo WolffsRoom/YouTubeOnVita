@@ -1433,6 +1433,13 @@ void* worker_main(void* arg) {
              (int)g_live_targets, (int)g_dead_count);
         prev_dec = p->total_frames; prev_shown = p->shown_frames; prev_drop = p->dropped_frames;
         prev_calls = p->frame_calls; prev_dec_us = p->decode_us;
+        // Every 30 seconds during active video playback: capture memory
+        // pressure alongside decoder/frame metrics without changing decoding.
+        static uint64_t last_playback_memory = 0;
+        if (nowt - last_playback_memory >= 30000000ull) {
+          last_playback_memory = nowt;
+          log_free_memory("playback_30s");
+        }
       }
     }
     {  // diagnostic heartbeat (dropped from the log unless verbose.txt)
