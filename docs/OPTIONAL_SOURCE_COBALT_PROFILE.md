@@ -13,7 +13,7 @@ The Vita loader uses exact ARM ELF relocation counts, fixed offsets and import c
 
 ## Limitations
 - The manual workflow is intentionally **not** triggered by pushes or pull requests; it is resource intensive.
-- This PR has **no confirmed PS Vita hardware results** and cannot guarantee the experimental source-built ELF is loadable. Fail-closed validation may reject unsupported layouts or imports.
+- The integrated fork's experimental source-built Cobalt was built and tested on physical PS Vita hardware. **This independently prepared upstream-source workflow and its exact resulting ELF have not yet been compiled and boot-tested in isolation**; results from the fork do not guarantee that a different ELF is loadable. Fail-closed validation may reject unsupported layouts or imports.
 - The official/default `libcobalt.so` is kept byte-identical; **the source-built experimental runtime is not claimed to match it byte-for-byte**.
 - No filter, advertising-blocking or SponsorBlock modifications are included.
 
